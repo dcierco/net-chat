@@ -4,6 +4,8 @@ use tokio::sync::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 use rand::{Rng, distributions::Alphanumeric};
+use tokio::time::{self, Duration};
+use tokio::fs;
 
 #[derive(Debug)]
 enum Command {
@@ -38,7 +40,8 @@ impl Command {
 struct Server {
     user_db: Arc<Mutex<HashMap<String, String>>>, // Username to password hashmap
     sessions: Arc<Mutex<HashMap<String, String>>>, // Username to session token hashmap
-    online_users: Arc<Mutex<HashMap<String, TcpStream>>>, // Username to TcpStream hashmap
+    online_users: Arc<Mutex<HashMap<String, Arc<Mutex<TcpStream>>>>>, // Username to TcpStream hashmap
+    file_transfers: Arc<Mutex<HashMap<String, Vec<Option<Vec<u8>>>>>>, // Track file transfers
 }
 
 impl Server {
@@ -67,7 +70,7 @@ impl Server {
             Err("Username not found".into())
         }
     }
-
+    
     async fn list_users(&self, username: String) -> String {
         let sessions = self.sessions.lock().await;
         if !sessions.contains_key(&username) {
@@ -79,22 +82,82 @@ impl Server {
         format!("LIST_USERS|SUCCESS|{}", users)
     }
 
-    async fn logout(&self, username: String) -> String {
+    async fn logout(&self, username: &str) -> String {
         let mut sessions = self.sessions.lock().await;
-        if sessions.remove(&username).is_some() {
+        if sessions.remove(username).is_some() {
             let mut online_users = self.online_users.lock().await;
-            online_users.remove(&username);
+            online_users.remove(username);
             "LOGOUT|SUCCESS".into()
         } else {
             "LOGOUT|FAILURE|User not authenticated".into()
         }
     }
 
+    async fn send_message(&self, from: String, to: String, content: String) -> Result<(), String> {
+        let online_users = self.online_users.lock().await;
+        if let Some(receiver_socket) = online_users.get(&to) {
+            let message = format!("MESSAGE|{}|{}", from, content);
+            let mut socket_lock = receiver_socket.lock().await;
+            if let Err(_) = socket_lock.write_all(message.as_bytes()).await {
+                return Err("Failed to send message".into());
+            }
+            Ok(())
+        } else {
+            Err("Recipient not online".into())
+        }
+    }
+
+async fn handle_file_transfer(&self, from: String, to: String, filename: String, packet_number: usize, data_size: usize, data: Vec<u8>) -> Result<(), String> {
+        let mut file_transfers = self.file_transfers.lock().await;
+
+        let key = format!("{}_{}", from, filename);
+
+        let transfer = file_transfers.entry(key.clone()).or_insert_with(|| vec![None; data_size]); // Initialize with None
+
+        if transfer.len() <= packet_number {
+            return Err("Invalid packet number".into());
+        }
+
+        transfer[packet_number] = Some(data);
+
+        if transfer.iter().all(|packet| packet.is_some()) {
+            // All packets received
+
+            let mut file_data = Vec::new();
+            for packet in transfer {
+                if let Some(data) = packet {
+                    file_data.extend_from_slice(data);
+                }
+            }
+
+            // Save file
+            if let Err(e) = fs::write(&filename, &file_data).await {
+                return Err(format!("Failed to write file: {:?}", e));
+            }
+
+            file_transfers.remove(&key);
+
+            // Notify the recipient
+            let online_users = self.online_users.lock().await;
+            if let Some(receiver_socket) = online_users.get(&to) {
+                let message = format!("FILE|SUCCESS|{}", filename);
+                let mut socket_lock = receiver_socket.lock().await;
+                if let Err(_) = socket_lock.write_all(message.as_bytes()).await {
+                    return Err("Failed to notify recipient".into());
+                }
+            } else {
+                return Err("Recipient not online".into());
+            }
+        }
+
+        Ok(())
+    }
+
     async fn handle_tcp_connection(self: Arc<Self>, socket: TcpStream) {
-        let mut socket = socket; // Unused mut warning resolved by re-assignment
+        let socket = Arc::new(Mutex::new(socket));
         let mut buffer = [0; 1024];
         loop {
-            let n = match socket.read(&mut buffer).await {
+            let n = match socket.lock().await.read(&mut buffer).await {
                 Ok(n) if n == 0 => break, // Connection closed
                 Ok(n) => n,
                 Err(_) => break,
@@ -104,64 +167,81 @@ impl Server {
                 match command {
                     Command::Register(username, hashed_password) => {
                         match self.register_user(username, hashed_password).await {
-                            Ok(_) => socket.write_all(b"REGISTER|SUCCESS").await.expect("Failed to write data"),
-                            Err(e) => socket.write_all(format!("REGISTER|FAILURE|{}", e).as_bytes()).await.expect("Failed to write data"),
+                            Ok(_) => socket.lock().await.write_all(b"REGISTER|SUCCESS").await.unwrap_or_else(|e| eprintln!("Error writing: {:?}", e)),
+                            Err(e) => socket.lock().await.write_all(format!("REGISTER|FAILURE|{}", e).as_bytes()).await.unwrap_or_else(|e| eprintln!("Error writing: {:?}", e)),
                         }
                     }
                     Command::Authenticate(username, hashed_password) => {
                         match self.authenticate_user(username.clone(), hashed_password).await {
                             Ok(token) => {
-                                self.online_users.lock().await.insert(username.clone(), socket.try_clone().unwrap());
-                                socket.write_all(format!("AUTH|SUCCESS|{}", token).as_bytes()).await.expect("Failed to write data");
-                            },
-                            Err(e) => socket.write_all(format!("AUTH|FAILURE|{}", e).as_bytes()).await.expect("Failed to write data"),
+                                let mut online_users = self.online_users.lock().await;
+                                online_users.insert(username.clone(), socket.clone());
+                                socket.lock().await.write_all(format!("AUTH|SUCCESS|{}", token).as_bytes()).await.unwrap_or_else(|e| eprintln!("Error writing: {:?}", e));
+                            }
+                            Err(e) => socket.lock().await.write_all(format!("AUTH|FAILURE|{}", e).as_bytes()).await.unwrap_or_else(|e| eprintln!("Error writing: {:?}", e)),
                         }
                     }
                     Command::SendMessage(from, to, content) => {
-                        // Handle message sending...
-                        // E.g., ensure `to` is an online user, then send the message
+                        if let Err(e) = self.send_message(from, to, content).await {
+                            socket.lock().await.write_all(format!("MESSAGE|FAILURE|{}", e).as_bytes()).await.unwrap_or_else(|e| eprintln!("Error writing: {:?}", e));
+                        } else {
+                            socket.lock().await.write_all(b"MESSAGE|SUCCESS").await.unwrap_or_else(|e| eprintln!("Error writing: {:?}", e));
+                        }
                     }
                     Command::SendFile(from, to, filename, packet_number, data_size, data) => {
-                        // Handle file transfer...
+                        if let Err(e) = self.handle_file_transfer(from, to, filename, packet_number, data_size, data).await {
+                            socket.lock().await.write_all(format!("FILE|FAILURE|{}", e).as_bytes()).await.unwrap_or_else(|e| eprintln!("Error writing: {:?}", e));
+                        } else {
+                            socket.lock().await.write_all(b"FILE|SUCCESS").await.unwrap_or_else(|e| eprintln!("Error writing: {:?}", e));
+                        }
                     }
                     Command::ListUsers(username) => {
                         let response = self.list_users(username).await;
-                        socket.write_all(response.as_bytes()).await.expect("Failed to write data");
+                        socket.lock().await.write_all(response.as_bytes()).await.unwrap_or_else(|e| eprintln!("Error writing: {:?}", e));
                     }
                     Command::Logout(username) => {
-                        let response = self.logout(username).await;
-                        socket.write_all(response.as_bytes()).await.expect("Failed to write data");
+                        let response = self.logout(&username).await;
+                        socket.lock().await.write_all(response.as_bytes()).await.unwrap_or_else(|e| eprintln!("Error writing: {:?}", e));
                         break; // Close connection after logout
                     }
                 }
             } else {
-                socket.write_all(b"ERROR|Unknown command").await.expect("Failed to write data");
+                socket.lock().await.write_all(b"ERROR|Unknown command").await.unwrap_or_else(|e| eprintln!("Error writing: {:?}", e));
             }
         }
     }
 
-    async fn handle_udp_socket(self: Arc<Self>, socket: UdpSocket) {
-        let mut buffer = [0; 1048]; // Extra for packet meta
-        loop {
-            let (n, _addr) = match socket.recv_from(&mut buffer).await {
-                Ok((n, addr)) => (n, addr),
-                Err(_) => continue,
-            };
-            let packet_info = String::from_utf8_lossy(&buffer[..n]);
-            let parts: Vec<&str> = packet_info.split('|').collect();
-            if parts.len() < 3 {
-                continue; // Invalid packet format
+async fn handle_udp_socket(self: Arc<Self>, socket: UdpSocket) {
+    let mut buffer = [0; 1500]; // Buffer size for UDP packets
+    loop {
+        let (n, addr) = match socket.recv_from(&mut buffer).await {
+            Ok((n, addr)) => (n, addr),
+            Err(_) => continue,
+        };
+
+        let packet_info = String::from_utf8_lossy(&buffer[..n]);
+        let parts: Vec<&str> = packet_info.split('|').collect();
+        if parts.len() < 5 {
+            eprintln!("Invalid packet format from {:?}", addr);
+            continue;
+        }
+
+        let from = parts[0].to_string();
+        let to = parts[1].to_string();
+        let filename = parts[2].to_string();
+        let packet_number: usize = match parts[3].parse() {
+            Ok(num) => num,
+            Err(_) => continue,
+        };
+        let data_size: usize = match parts[4].parse() {
+            Ok(size) => size,
+            Err(_) => continue,
+        };
+        let data = buffer[packet_info.len()..packet_info.len() + data_size].to_vec();
+
+        if let Err(e) = self.handle_file_transfer(from, to, filename, packet_number, data_size, data).await {
+            eprintln!("Error handling file transfer: {:?}", e);
             }
-            let packet_number: usize = match parts[0].parse() {
-                Ok(num) => num,
-                Err(_) => continue,
-            };
-            let data_size: usize = match parts[1].parse() {
-                Ok(size) => size,
-                Err(_) => continue,
-            };
-            let data = buffer[2..2 + data_size].to_vec();
-            // Handle file transfer...
         }
     }
 }
@@ -171,7 +251,9 @@ async fn main() -> io::Result<()> {
     let user_db = Arc::new(Mutex::new(HashMap::new()));
     let sessions = Arc::new(Mutex::new(HashMap::new()));
     let online_users = Arc::new(Mutex::new(HashMap::new()));
-    let server = Arc::new(Server { user_db, sessions, online_users });
+    let file_transfers: Arc<Mutex<HashMap<_, _>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    let server = Arc::new(Server { user_db, sessions, online_users, file_transfers});
 
     let tcp_listener = TcpListener::bind("127.0.0.1:8080").await?;
     let udp_socket = UdpSocket::bind("127.0.0.1:8081").await?;
@@ -194,6 +276,6 @@ async fn main() -> io::Result<()> {
 
     // Keep the main function running
     loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        time::sleep(Duration::from_secs(60)).await;
     }
 }

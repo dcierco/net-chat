@@ -11,6 +11,8 @@ enum Command {
     Authenticate(String, String),
     SendMessage(String, String, String),
     SendFile(String, String, String, usize, usize, Vec<u8>),
+    ListUsers(String),
+    Logout(String),
 }
 
 impl Command {
@@ -26,6 +28,8 @@ impl Command {
                 let data = parts[6..].join("|").into_bytes();
                 Some(Command::SendFile(parts[1].to_string(), parts[2].to_string(), parts[3].to_string(), packet_number, data_size, data))
             },
+            "LIST_USERS" if parts.len() == 2 => Some(Command::ListUsers(parts[1].to_string())),
+            "LOGOUT" if parts.len() == 2 => Some(Command::Logout(parts[1].to_string())),
             _ => None,
         }
     }
@@ -34,6 +38,7 @@ impl Command {
 struct Server {
     user_db: Arc<Mutex<HashMap<String, String>>>, // Username to password hashmap
     sessions: Arc<Mutex<HashMap<String, String>>>, // Username to session token hashmap
+    online_users: Arc<Mutex<HashMap<String, TcpStream>>>, // Username to TcpStream hashmap
 }
 
 impl Server {
@@ -63,7 +68,30 @@ impl Server {
         }
     }
 
-    async fn handle_tcp_connection(self: Arc<Self>, mut socket: TcpStream) {
+    async fn list_users(&self, username: String) -> String {
+        let sessions = self.sessions.lock().await;
+        if !sessions.contains_key(&username) {
+            return "AUTH|FAILURE|User not authenticated".into();
+        }
+
+        let online_users = self.online_users.lock().await;
+        let users = online_users.keys().cloned().collect::<Vec<_>>().join(",");
+        format!("LIST_USERS|SUCCESS|{}", users)
+    }
+
+    async fn logout(&self, username: String) -> String {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.remove(&username).is_some() {
+            let mut online_users = self.online_users.lock().await;
+            online_users.remove(&username);
+            "LOGOUT|SUCCESS".into()
+        } else {
+            "LOGOUT|FAILURE|User not authenticated".into()
+        }
+    }
+
+    async fn handle_tcp_connection(self: Arc<Self>, socket: TcpStream) {
+        let mut socket = socket; // Unused mut warning resolved by re-assignment
         let mut buffer = [0; 1024];
         loop {
             let n = match socket.read(&mut buffer).await {
@@ -81,16 +109,29 @@ impl Server {
                         }
                     }
                     Command::Authenticate(username, hashed_password) => {
-                        match self.authenticate_user(username, hashed_password).await {
-                            Ok(token) => socket.write_all(format!("AUTH|SUCCESS|{}", token).as_bytes()).await.expect("Failed to write data"),
+                        match self.authenticate_user(username.clone(), hashed_password).await {
+                            Ok(token) => {
+                                self.online_users.lock().await.insert(username.clone(), socket.try_clone().unwrap());
+                                socket.write_all(format!("AUTH|SUCCESS|{}", token).as_bytes()).await.expect("Failed to write data");
+                            },
                             Err(e) => socket.write_all(format!("AUTH|FAILURE|{}", e).as_bytes()).await.expect("Failed to write data"),
                         }
                     }
                     Command::SendMessage(from, to, content) => {
                         // Handle message sending...
+                        // E.g., ensure `to` is an online user, then send the message
                     }
                     Command::SendFile(from, to, filename, packet_number, data_size, data) => {
                         // Handle file transfer...
+                    }
+                    Command::ListUsers(username) => {
+                        let response = self.list_users(username).await;
+                        socket.write_all(response.as_bytes()).await.expect("Failed to write data");
+                    }
+                    Command::Logout(username) => {
+                        let response = self.logout(username).await;
+                        socket.write_all(response.as_bytes()).await.expect("Failed to write data");
+                        break; // Close connection after logout
                     }
                 }
             } else {
@@ -129,7 +170,8 @@ impl Server {
 async fn main() -> io::Result<()> {
     let user_db = Arc::new(Mutex::new(HashMap::new()));
     let sessions = Arc::new(Mutex::new(HashMap::new()));
-    let server = Arc::new(Server { user_db, sessions });
+    let online_users = Arc::new(Mutex::new(HashMap::new()));
+    let server = Arc::new(Server { user_db, sessions, online_users });
 
     let tcp_listener = TcpListener::bind("127.0.0.1:8080").await?;
     let udp_socket = UdpSocket::bind("127.0.0.1:8081").await?;

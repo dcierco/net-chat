@@ -45,24 +45,28 @@ struct Server {
 }
 
 impl Server {
-    async fn register_user(&self, username: String, hashed_password: String) -> Result<(), String> {
+    async fn register_user(&self, username: &str, hashed_password: &str) -> Result<(), String> {
         let mut db = self.user_db.lock().await;
-        if db.contains_key(&username) {
+        if db.contains_key(username) {
             Err("Username already taken".into())
         } else {
-            db.insert(username.clone(), hashed_password);
+            db.insert(username.to_string(), hashed_password.to_string());
             info!("User registered: {}", username);
             Ok(())
         }
     }
 
-    async fn authenticate_user(&self, username: String, hashed_password: String) -> Result<String, String> {
+    async fn authenticate_user(&self, username: &str, hashed_password: &str) -> Result<String, String> {
         let db = self.user_db.lock().await;
-        if let Some(stored_hash) = db.get(&username) {
-            if stored_hash == &hashed_password {
-                let session_token: String = rand::thread_rng().sample_iter(&Alphanumeric).take(30).map(char::from).collect();
+        if let Some(stored_hash) = db.get(username) {
+            if stored_hash == hashed_password {
+                let session_token: String = rand::thread_rng()
+                    .sample_iter(&Alphanumeric)
+                    .take(30)
+                    .map(char::from)
+                    .collect();
                 let mut sessions = self.sessions.lock().await;
-                sessions.insert(username.clone(), session_token.clone());
+                sessions.insert(username.to_string(), session_token.clone());
                 info!("User authenticated: {}", username);
                 Ok(session_token)
             } else {
@@ -73,9 +77,9 @@ impl Server {
         }
     }
 
-    async fn list_users(&self, username: String) -> String {
+    async fn list_users(&self, username: &str) -> String {
         let sessions = self.sessions.lock().await;
-        if !sessions.contains_key(&username) {
+        if !sessions.contains_key(username) {
             return "AUTH|FAILURE|User not authenticated".into();
         }
         let online_users = self.online_users.lock().await;
@@ -96,27 +100,23 @@ impl Server {
         }
     }
 
-    async fn send_message(&self, from: String, to: String, content: String) -> Result<(), String> {
+    async fn send_message(&self, from: &str, to: &str, content: &str) -> Result<(), String> {
         let online_users = self.online_users.lock().await;
-        if let Some(receiver_socket) = online_users.get(&to) {
+        if let Some(receiver_socket) = online_users.get(to) {
             let message = format!("MESSAGE|{}|{}", from, content);
             let mut socket_lock = receiver_socket.lock().await;
-            match socket_lock.write_all(message.as_bytes()).await {
-                Ok(_) => {
-                    info!("Message sent from {} to {}", from, to);
-                    Ok(())
-                },
-                Err(_) => {
-                    error!("Failed to send message from {} to {}", from, to);
-                    Err("Failed to send message".into())
-                },
+            if socket_lock.write_all(message.as_bytes()).await.is_err() {
+                error!("Failed to send message from {} to {}", from, to);
+                return Err("Failed to send message".into());
             }
+            info!("Message sent from {} to {}", from, to);
+            Ok(())
         } else {
             Err("Recipient not online".into())
         }
     }
 
-    async fn handle_file_transfer(&self, from: String, to: String, filename: String, packet_number: usize, data_size: usize, data: Vec<u8>) -> Result<(), String> {
+    async fn handle_file_transfer(&self, from: &str, to: &str, filename: &str, packet_number: usize, data_size: usize, data: Vec<u8>) -> Result<(), String> {
         let mut file_transfers = self.file_transfers.lock().await;
         let key = format!("{}_{}", from, filename);
         let transfer = file_transfers.entry(key.clone()).or_insert_with(|| vec![None; data_size]);
@@ -129,13 +129,13 @@ impl Server {
 
         if transfer.iter().all(|packet| packet.is_some()) {
             let mut file_data = Vec::new();
-            for packet in transfer {
-                if let Some(data) = packet {
-                    file_data.extend_from_slice(data);
+            for packet in transfer.iter_mut() {
+                if let Some(data) = packet.take() {
+                    file_data.extend_from_slice(&data);
                 }
             }
 
-            if let Err(e) = fs::write(&filename, &file_data).await {
+            if let Err(e) = fs::write(filename, &file_data).await {
                 error!("Failed to write file: {:?}", e);
                 return Err(format!("Failed to write file: {:?}", e));
             }
@@ -144,10 +144,10 @@ impl Server {
             info!("File successfully transferred: {}", filename);
 
             let online_users = self.online_users.lock().await;
-            if let Some(receiver_socket) = online_users.get(&to) {
+            if let Some(receiver_socket) = online_users.get(to) {
                 let message = format!("FILE|SUCCESS|{}", filename);
                 let mut socket_lock = receiver_socket.lock().await;
-                if let Err(_) = socket_lock.write_all(message.as_bytes()).await {
+                if socket_lock.write_all(message.as_bytes()).await.is_err() {
                     error!("Failed to notify recipient: {}", to);
                     return Err("Failed to notify recipient".into());
                 }
@@ -174,14 +174,14 @@ impl Server {
             let command_str = String::from_utf8_lossy(&buffer[..n]);
             if let Some(command) = Command::from_str(&command_str) {
                 match command {
-                    Command::Register(username, hashed_password) => {
-                        match self.register_user(username.clone(), hashed_password).await {
+                    Command::Register(ref username, ref hashed_password) => {
+                        match self.register_user(username, hashed_password).await {
                             Ok(_) => socket.lock().await.write_all(b"REGISTER|SUCCESS").await.unwrap_or_else(|e| error!("Error writing: {:?}", e)),
                             Err(e) => socket.lock().await.write_all(format!("REGISTER|FAILURE|{}", e).as_bytes()).await.unwrap_or_else(|e| error!("Error writing: {:?}", e)),
                         }
                     }
-                    Command::Authenticate(username, hashed_password) => {
-                        match self.authenticate_user(username.clone(), hashed_password).await {
+                    Command::Authenticate(ref username, ref hashed_password) => {
+                        match self.authenticate_user(username, hashed_password).await {
                             Ok(token) => {
                                 let mut online_users = self.online_users.lock().await;
                                 online_users.insert(username.clone(), socket.clone());
@@ -190,26 +190,26 @@ impl Server {
                             Err(e) => socket.lock().await.write_all(format!("AUTH|FAILURE|{}", e).as_bytes()).await.unwrap_or_else(|e| error!("Error writing: {:?}", e)),
                         }
                     }
-                    Command::SendMessage(from, to, content) => {
+                    Command::SendMessage(ref from, ref to, ref content) => {
                         if let Err(e) = self.send_message(from, to, content).await {
                             socket.lock().await.write_all(format!("MESSAGE|FAILURE|{}", e).as_bytes()).await.unwrap_or_else(|e| error!("Error writing: {:?}", e));
                         } else {
                             socket.lock().await.write_all(b"MESSAGE|SUCCESS").await.unwrap_or_else(|e| error!("Error writing: {:?}", e));
                         }
                     }
-                    Command::SendFile(from, to, filename, packet_number, data_size, data) => {
+                    Command::SendFile(ref from, ref to, ref filename, packet_number, data_size, data) => {
                         if let Err(e) = self.handle_file_transfer(from, to, filename, packet_number, data_size, data).await {
                             socket.lock().await.write_all(format!("FILE|FAILURE|{}", e).as_bytes()).await.unwrap_or_else(|e| error!("Error writing: {:?}", e));
                         } else {
                             socket.lock().await.write_all(b"FILE|SUCCESS").await.unwrap_or_else(|e| error!("Error writing: {:?}", e));
                         }
                     }
-                    Command::ListUsers(username) => {
+                    Command::ListUsers(ref username) => {
                         let response = self.list_users(username).await;
                         socket.lock().await.write_all(response.as_bytes()).await.unwrap_or_else(|e| error!("Error writing: {:?}", e));
                     }
-                    Command::Logout(username) => {
-                        let response = self.logout(&username).await;
+                    Command::Logout(ref username) => {
+                        let response = self.logout(username).await;
                         socket.lock().await.write_all(response.as_bytes()).await.unwrap_or_else(|e| error!("Error writing: {:?}", e));
                         break;
                     }
@@ -238,9 +238,9 @@ impl Server {
                 continue;
             }
 
-            let from = parts[0].to_string();
-            let to = parts[1].to_string();
-            let filename = parts[2].to_string();
+            let from = parts[0];
+            let to = parts[1];
+            let filename = parts[2];
             let packet_number: usize = match parts[3].parse() {
                 Ok(num) => num,
                 Err(_) => {
@@ -281,11 +281,12 @@ async fn main() -> io::Result<()> {
     let tcp_server = server.clone();
     tokio::spawn(async move {
         loop {
-            let (socket, _) = tcp_listener.accept().await.expect("Failed to accept socket");
-            let tcp_server = tcp_server.clone();
-            tokio::spawn(async move {
-                tcp_server.handle_tcp_connection(socket).await;
-            });
+            if let Ok((socket, _)) = tcp_listener.accept().await {
+                let tcp_server = tcp_server.clone();
+                tokio::spawn(async move {
+                    tcp_server.handle_tcp_connection(socket).await;
+                });
+            }
         }
     });
     info!("TCP server running on 127.0.0.1:8080");

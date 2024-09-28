@@ -4,8 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{RwLock, Mutex};
-use tokio::time::{timeout, Duration};
+use tokio::sync::Mutex;
 
 use log::{info, warn, error};
 use tokio::sync::oneshot;
@@ -122,80 +121,54 @@ impl Server {
             Transport::Tcp => {
                 if let Some(tcp_stream) = receiver_stream {
                     println!("Attempting to acquire receiver's socket lock");
-                    let mut socket_lock = tcp_stream.lock().await;
+                    let mut locked_stream = tcp_stream.lock().await;
                     println!("Acquired receiver's socket lock");
-
-                    println!("Writing message to receiver");
-                    socket_lock.write_all(message.as_bytes()).await.map_err(|e| format!("Failed to send TCP message: {}", e))?;
-                    socket_lock.flush().await.map_err(|e| format!("Failed to flush receiver's socket: {}", e))?;
-                    println!("Message sent to {}", to);
-                    drop(socket_lock);
-                    println!("Released receiver's socket lock");
-
-                    // Send confirmation to sender
-                    if let Some(sender_stream) = sender_stream {
-                        println!("Attempting to send confirmation to sender");
-                        let mut sender_lock = sender_stream.lock().await;
-                        println!("Acquired sender's socket lock");
-                        sender_lock.write_all(b"MESSAGE|SUCCESS\n").await.map_err(|e| format!("Failed to send confirmation: {}", e))?;
-                        sender_lock.flush().await.map_err(|e| format!("Failed to flush sender's socket: {}", e))?;
-                        println!("Confirmation sent to {}", from);
-                        drop(sender_lock);
-                        println!("Released sender's socket lock");
-                    } else {
-                        println!("Sender does not have a TCP stream");
-                        return Err(format!("Sender {} does not have a TCP stream", from));
-                    }
-
-                    println!("Message successfully sent from {} to {} over TCP", from, to);
-                    Ok(())
+                    locked_stream.write_all(message.as_bytes()).await.map_err(|e| e.to_string())?;
+                    println!("Message written to receiver's socket");
+                    locked_stream.flush().await.map_err(|e| e.to_string())?;
+                    println!("Message flushed to receiver's socket");
                 } else {
-                    Err(format!("Recipient {} not connected via TCP", to))
+                    return Err(format!("Recipient {} does not have a TCP stream", to));
                 }
             }
             Transport::Udp => {
                 if let Some(udp_addr) = receiver_udp_addr {
-                    println!("Sending message via UDP");
-                    self.udp_socket.send_to(message.as_bytes(), udp_addr).await
-                        .map_err(|e| format!("Failed to send UDP message: {}", e))?;
-                    println!("Message sent from {} to {} over UDP", from, to);
-                    Ok(())
+                    self.udp_socket.send_to(message.as_bytes(), udp_addr).await.map_err(|e| e.to_string())?;
                 } else {
-                    Err(format!("Recipient {} not connected via UDP", to))
+                    return Err(format!("Recipient {} does not have a UDP address", to));
                 }
             }
         }
-    }
 
+        // Send confirmation back to the sender
+        if let Some(tcp_stream) = sender_stream {
+            let confirmation = format!("MESSAGE|SUCCESS\n");
+            let mut locked_stream = tcp_stream.lock().await;
+            locked_stream.write_all(confirmation.as_bytes()).await.map_err(|e| e.to_string())?;
+            locked_stream.flush().await.map_err(|e| e.to_string())?;
+        }
+
+        Ok(())
+    }
 
     async fn handle_command(&self, command: Command, tcp_stream: Option<Arc<Mutex<Box<dyn AsyncStream + Send>>>>, udp_addr: Option<SocketAddr>) -> (String, Option<String>) {
         match command {
             Command::Register(username) => {
-                info!("Handling REGISTER command for user: {}", username);
                 match self.register_user(&username, tcp_stream, udp_addr).await {
-                    Ok(_) => (format!("REGISTER|SUCCESS"), Some(username)),
-                    Err(e) => (format!("REGISTER|FAILURE|{}", e), None),
+                    Ok(_) => ("REGISTER|SUCCESS".into(), None),
+                    Err(err) => (format!("REGISTER|FAILURE|{}", err), None),
                 }
             }
             Command::SendMessage(from, to, content, transport) => {
-                info!("Handling SendMessage: from={}, to={}, content={:?}, transport={:?}", from, to, content, transport);
                 match self.send_message(&from, &to, &content, &transport).await {
-                    Ok(_) => {
-                        info!("Message sent successfully");
-                        ("MESSAGE|SUCCESS".into(), None)
-                    },
-                    Err(e) => {
-                        error!("Failed to send message: {}", e);
-                        (format!("MESSAGE|FAILURE|{}", e), None)
-                    },
+                    Ok(_) => ("MESSAGE|SUCCESS".into(), None),
+                    Err(err) => (format!("MESSAGE|FAILURE|{}", err), None),
                 }
             }
             Command::ListUsers(username) => {
-                info!("Handling LIST USERS command for user: {}", username);
                 (self.list_users(&username).await, None)
             }
             Command::Disconnect(username) => {
-                info!("Handling DISCONNECT command for user: {}", username);
                 (self.disconnect(&username).await, None)
             }
         }
@@ -204,64 +177,35 @@ impl Server {
     async fn handle_tcp_connection(self: Arc<Self>, socket: TcpStream) {
         let socket: Arc<Mutex<Box<dyn AsyncStream + Send>>> = Arc::new(Mutex::new(Box::new(socket)));
         let mut buffer = [0; 2048];
-        let mut username = String::new();
+        let username = String::new();
 
         loop {
-            let mut locked_socket = socket.lock().await;
-            match locked_socket.read(&mut buffer).await {
-                Ok(0) => {
-                    info!("Client disconnected");
+            let n = match socket.lock().await.read(&mut buffer).await {
+                Ok(n) if n == 0 => {
                     break;
                 }
-                Ok(n) => {
-                    let command_str = String::from_utf8_lossy(&buffer[..n]).trim().to_string();
-                    info!("Received command: {}", command_str);
-                    if command_str.is_empty() {
-                        continue;
-                    }
-                    if let Some(command) = Command::from_str(&command_str) {
-                        let (response, new_username) = self.handle_command(command, Some(Arc::clone(&socket)), None).await;
-                        info!("Sending response: {}", response);
-                        if let Err(e) = locked_socket.write_all(response.as_bytes()).await {
-                            error!("Failed to write response: {}", e);
-                            continue;
-                        }
-                        if let Err(e) = locked_socket.write_all(b"\n").await {
-                            error!("Failed to write newline: {}", e);
-                            continue;
-                        }
-                        if let Err(e) = locked_socket.flush().await {
-                            error!("Failed to flush socket: {}", e);
-                            continue;
-                        }
-                        info!("Response sent successfully");
-
-                        // Update username if provided
-                        if let Some(new_name) = new_username {
-                            username = new_name;
-                            info!("Updated username to: {}", username);
-                        }
-                    } else {
-                        warn!("Unknown command: {}", command_str);
-                        if let Err(e) = locked_socket.write_all(b"ERROR|Unknown command\n").await {
-                            error!("Failed to write error response: {}", e);
-                            continue;
-                        }
-                        if let Err(e) = locked_socket.flush().await {
-                            error!("Failed to flush socket after error: {}", e);
-                            continue;
-                        }
-                    }
-                }
+                Ok(n) => n,
                 Err(e) => {
-                    error!("TCP connection error: {:?}", e);
+                    error!("Failed to read from socket; err = {:?}", e);
                     break;
-                },
+                }
+            };
+
+            let command_str = String::from_utf8_lossy(&buffer[..n]);
+            if let Some(command) = Command::from_str(&command_str) {
+                println!("Received command: {:?}", command);
+                let (response, _) = self.handle_command(command, Some(socket.clone()), None).await;
+                println!("Sending response: {}", response);
+                if let Err(e) = socket.lock().await.write_all(response.as_bytes()).await {
+                    error!("Failed to write to socket; err = {:?}", e);
+                    break;
+                }
             }
         }
+
         info!("TCP connection closed for user: {}", username);
         if !username.is_empty() {
-            let _ = self.disconnect(&username).await;
+            self.disconnect(&username).await;
         }
     }
 
@@ -273,12 +217,8 @@ impl Server {
                     let command_str = String::from_utf8_lossy(&buffer[..n]);
                     if let Some(command) = Command::from_str(&command_str) {
                         let (response, _) = self.handle_command(command, None, Some(addr)).await;
-                        if self.udp_socket.send_to(response.as_bytes(), addr).await.is_err() {
-                            error!("Error sending UDP response");
-                        }
-                    } else {
-                        if self.udp_socket.send_to(b"ERROR|Unknown command", addr).await.is_err() {
-                            error!("Error sending UDP error response");
+                        if let Err(e) = self.udp_socket.send_to(response.as_bytes(), addr).await {
+                            warn!("Failed to send UDP response; err = {:?}", e);
                         }
                     }
                 },
@@ -290,7 +230,8 @@ impl Server {
     }
 }
 
-pub async fn run_server(shutdown: impl Future<Output = ()> + Send + 'static) -> io::Result<()> {    env_logger::init();
+pub async fn run_server(shutdown: impl Future<Output = ()> + Send + 'static) -> io::Result<()> {
+    env_logger::init();
 
     let online_users = Arc::new(Mutex::new(HashMap::new()));
     let udp_socket = Arc::new(UdpSocket::bind("127.0.0.1:8081").await?);

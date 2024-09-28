@@ -10,6 +10,15 @@ rand = "0.8.4"
 log = "0.4.22"
 env_logger = "0.11.5"
 
+[dev-dependencies]
+tokio = { version = "1.40.0", features = ["full", "test-util"] }
+tokio-test = "0.4"
+futures = "0.3"
+
+[[test]]
+name = "integration"
+path = "tests/integration_tests.rs"
+
 [[bin]]
 name = "client"
 path = "src/client.rs"

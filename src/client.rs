@@ -1,328 +1,229 @@
-use tokio::net::{TcpStream, UdpSocket};
-use tokio::io::{self, AsyncWriteExt, AsyncReadExt};
-use tokio::sync::{mpsc, Mutex};
-use std::env;
-use std::sync::Arc;
-use std::future::Future;
-use std::pin::Pin;
+use std::net::TcpStream;
+use std::io::{self, BufReader, BufWriter, Write};
+use log::{info, error};
+use std::fs::File;
+use std::path::Path;
+use crate::common::{Command, send_command, receive_message, send_file, ServerResponse};
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Transport {
-    Tcp,
-    Udp,
-}
+pub fn start_client(address: &str) -> std::io::Result<()> {
+    info!("Connecting to server at {}", address);
+    let stream = TcpStream::connect(address)?;
+    let reader = BufReader::new(stream.try_clone()?);
+    let mut writer = BufWriter::new(stream);
 
-#[derive(Debug, PartialEq)]
-pub enum Command {
-    Register(String),
-    SendMessage(String, String, String, Transport),
-    ListUsers(String),
-    Disconnect(String),
-}
+    print!("Enter your name: ");
+    io::stdout().flush()?;
+    let mut name = String::new();
+    io::stdin().read_line(&mut name)?;
+    let name = name.trim().to_string();
 
-async fn client_main(server_address: &str, client_address: &str) -> io::Result<()> {
-    let tcp_stream = Arc::new(Mutex::new(TcpStream::connect(server_address).await?));
-    let udp_socket = Arc::new(UdpSocket::bind(client_address).await?);
-    udp_socket.connect(server_address).await?;
+    send_command(&mut writer, &Command::Register(name.clone()))?;
 
-    let (tx, mut rx) = mpsc::channel(100);
-    let udp_socket_clone = Arc::clone(&udp_socket);
-
-    // Spawn a task to handle incoming UDP messages
-    tokio::spawn(async move {
-        let mut buf = [0; 1024];
+    // Start a thread to handle incoming messages
+    let reader_clone = reader.get_ref().try_clone()?;
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(reader_clone);
         loop {
-            match udp_socket_clone.recv_from(&mut buf).await {
-                Ok((len, _)) => {
-                    println!("Received UDP: {}", String::from_utf8_lossy(&buf[..len]));
+            match receive_message(&mut reader) {
+                Ok(Some(Ok(Command::Scream(msg)))) => println!("\nBroadcast: {}", msg),
+                Ok(Some(Ok(Command::Whisper(from, msg)))) => println!("\nWhisper from {}: {}", from, msg),
+                Ok(Some(Err(ServerResponse::RegistrationSuccessful))) => println!("\nRegistration successful"),
+                Ok(Some(Err(ServerResponse::Message(msg)))) => println!("\nServer: {}", msg),
+                Ok(Some(Ok(Command::SendFile(sender, filename, content)))) => if let Err(e) = handle_received_file(&sender, &filename, &content) { println!("\nFailed to save received file: {}", e);}
+                Ok(Some(Err(ServerResponse::FileTransferStarted(filename)))) => println!("\nReceiving file: {}", filename),
+                Ok(Some(Err(ServerResponse::FileTransferComplete(filename)))) => println!("\nFile received: {}", filename),
+                Ok(Some(Err(ServerResponse::FileTransferFailed(error)))) => println!("\nFile transfer failed: {}", error),
+                Ok(Some(Err(ServerResponse::UserList(users)))) => println!("\nOnline users: {}", users.join(", ")),
+                Ok(None) => {
+                    println!("\nServer disconnected");
+                    break;
                 }
-                Err(e) => eprintln!("UDP receive error: {}", e),
-            }
-        }
-    });
-
-    // Spawn a task to handle incoming TCP messages
-    let tcp_stream_clone = Arc::clone(&tcp_stream);
-    tokio::spawn(async move {
-        let mut buf = [0; 1024];
-        loop {
-            let mut locked_stream = tcp_stream_clone.lock().await;
-            match locked_stream.read(&mut buf).await {
-                Ok(0) => break, // Connection closed
-                Ok(n) => {
-                    println!("Received TCP: {}", String::from_utf8_lossy(&buf[..n]));
-                }
+                Ok(_) => {}
                 Err(e) => {
-                    eprintln!("TCP receive error: {}", e);
+                    error!("Error receiving message: {}", e);
                     break;
                 }
             }
+            print!("Enter command: ");
+            io::stdout().flush().unwrap();
         }
     });
 
-    let mut current_user: Option<String> = None;
-
     loop {
-        tokio::select! {
-            Some(command) = rx.recv() => {
-                handle_command(command, &tcp_stream, &udp_socket, &mut current_user).await?;
-            }
-            result = get_user_input() => {
-                match result {
-                    Ok(command) => {
-                        tx.send(command).await.unwrap();
-                    }
-                    Err(e) => eprintln!("Error: {}", e),
+        print!("Enter command: ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let input = input.trim();
+
+        if input.eq_ignore_ascii_case("quit") {
+            send_command(&mut writer, &Command::Disconnect)?;
+            break;
+        }
+
+        let parts: Vec<&str> = input.split('/').collect();
+        if parts.len() >= 2 {
+            match parts[1] {
+                "Scream" => {
+                    send_command(&mut writer, &Command::Scream(parts[2].to_string()))?;
                 }
-            }
+                "Whisper" => {
+                    if parts.len() >= 4 {
+                        send_command(&mut writer, &Command::Whisper(parts[2].to_string(), parts[3].to_string()))?;
+                    } else {
+                        println!("Invalid Whisper command. Use: /Whisper/recipient/message/");
+                    }
+                }
+                "ListUsers" => {
+                    send_command(&mut writer, &Command::ListUsers)?;
+                }
+                "SendFile" => {
+                    if parts.len() >= 4 {
+                        let recipient = parts[2];
+                        let filename = parts[3];
+                        send_file_command(&mut writer, recipient, filename)?;
+                    } else {
+                        println!("Invalid SendFile command. Use: /SendFile/recipient/filename");
+                    }
+                }
+                _ => println!("Unknown command. Use /Scream/, /Whisper/, /ListUsers/, or /SendFile/"),      }
+        } else {
+            println!("Invalid command format. Use: `/Command/Message/`, `/Whisper/<recipient>/Message/`, `/ListUsers/` or `/SendFile/<recipient>/<filename>/`");
         }
     }
-}
 
-pub trait UdpSocketLike {
-    fn send<'a>(&'a self, buf: &'a [u8]) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>>;
-}
-
-impl UdpSocketLike for Arc<UdpSocket> {
-    fn send<'a>(&'a self, buf: &'a [u8]) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>> {
-        Box::pin(UdpSocket::send(self, buf))
-    }
-}
-
-pub async fn handle_command<T, U>(
-    command: Command,
-    tcp_stream: &Arc<tokio::sync::Mutex<T>>,
-    udp_socket: &U,
-    current_user: &mut Option<String>,
-) -> io::Result<()>
-where
-    T: AsyncReadExt + AsyncWriteExt + Unpin,
-    U: UdpSocketLike,
-{
-    match command {
-        Command::Register(username) => {
-            let cmd = format!("REGISTER|{}", username);
-            tcp_stream.lock().await.write_all(cmd.as_bytes()).await?;
-            *current_user = Some(username);
-        }
-        Command::SendMessage(from, to, content, transport) => {
-            let cmd = format!("MESSAGE|{}|{}|{}|{}", from, to, content,
-                              match transport {
-                                  Transport::Tcp => "TCP",
-                                  Transport::Udp => "UDP",
-                              });
-            match transport {
-                Transport::Tcp => tcp_stream.lock().await.write_all(cmd.as_bytes()).await?,
-                Transport::Udp => { udp_socket.send(cmd.as_bytes()).await?; }
-            }
-        }
-        Command::ListUsers(username) => {
-            let cmd = format!("LIST_USERS|{}", username);
-            tcp_stream.lock().await.write_all(cmd.as_bytes()).await?;
-        }
-        Command::Disconnect(username) => {
-            let cmd = format!("DISCONNECT|{}", username);
-            tcp_stream.lock().await.write_all(cmd.as_bytes()).await?;
-            *current_user = None;
-        }
-    }
+    info!("Disconnecting from server");
     Ok(())
 }
 
-pub async fn get_user_input() -> Result<Command, &'static str> {
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input).unwrap();
-    let input = input.trim();
-
-    let parts: Vec<&str> = input.split_whitespace().collect();
-    match parts[0] {
-        "register" if parts.len() == 2 => Ok(Command::Register(parts[1].to_string())),
-        "message" if parts.len() >= 4 => {
-            let from = parts[1].to_string();
-            let to = parts[2].to_string();
-            let content = parts[3..].join(" ");
-            let transport = if parts.last().unwrap() == &"UDP" {
-                Transport::Udp
-            } else {
-                Transport::Tcp
-            };
-            Ok(Command::SendMessage(from, to, content, transport))
-        }
-        "list" if parts.len() == 2 => Ok(Command::ListUsers(parts[1].to_string())),
-        "disconnect" if parts.len() == 2 => Ok(Command::Disconnect(parts[1].to_string())),
-        _ => Err("Invalid command. Use: register <username>, message <from> <to> <content> [UDP], list <username>, or disconnect <username>"),
-    }
-}
-
-#[tokio::main]
-async fn main() -> io::Result<()> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
-        eprintln!("Usage: client <server_address> <client_address>");
+fn send_file_command(writer: &mut impl Write, recipient: &str, filename: &str) -> io::Result<()> {
+    let path = Path::new(filename);
+    if !path.exists() {
+        println!("File not found: {}", filename);
         return Ok(());
     }
-    let server_address: &String = &args[1];
-    let client_address: &String = &args[2];
 
-    client_main(server_address, client_address).await
+    let mut file = File::open(path)?;
+    send_file(&mut file, recipient, filename, writer)?;
+    println!("File sent: {}", filename);
+    Ok(())
+}
+
+fn handle_received_file(sender: &str, filename: &str, content: &[u8]) -> io::Result<()> {
+    let path = Path::new(filename);
+    let display_name = path.file_name().unwrap().to_string_lossy();
+    let mut file = File::create(path)?;
+    file.write_all(content)?;
+    println!("\nReceived file '{}' from {}", display_name, sender);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+
     use super::*;
-    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-    use std::task::{Context, Poll};
-    use std::sync::Mutex;
+    use std::net::TcpListener;
+    use std::path::PathBuf;
+    use std::{fs, thread};
+    use std::time::Duration;
+    use crate::common::receive_command;
+    use crate::initialize;
 
-    struct MockUdpSocket {
-        tx: mpsc::Sender<String>,
-        sent_messages: Mutex<Vec<String>>,
-    }
+    #[test]
+    fn test_client_registration_and_messaging() {
+        initialize();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
 
-    impl MockUdpSocket {
-        fn new(tx: mpsc::Sender<String>) -> Self {
-            MockUdpSocket {
-                tx,
-                sent_messages: Mutex::new(Vec::new()),
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = BufWriter::new(stream);
+
+            if let Ok(Some(command)) = receive_command(&mut reader) {
+                assert!(matches!(command, Command::Register(name) if name == "TestUser"));
             }
-        }
 
-        async fn send(&self, buf: &[u8]) -> io::Result<usize> {
-            let msg = String::from_utf8_lossy(buf).to_string();
-            self.tx.send(msg.clone()).await.unwrap();
-            self.sent_messages.lock().unwrap().push(msg);
-            Ok(buf.len())
-        }
-
-        fn get_sent_messages(&self) -> Vec<String> {
-            self.sent_messages.lock().unwrap().clone()
-        }
-    }
-
-    impl UdpSocketLike for MockUdpSocket {
-        fn send<'a>(&'a self, buf: &'a [u8]) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>> {
-            Box::pin(self.send(buf))
-        }
-    }
-
-    #[tokio::test]
-    async fn test_get_user_input() {
-        let inputs = vec![
-            ("register alice", Ok(Command::Register("alice".to_string()))),
-            ("message alice bob hello", Ok(Command::SendMessage("alice".to_string(), "bob".to_string(), "hello".to_string(), Transport::Tcp))),
-            ("message alice bob hello UDP", Ok(Command::SendMessage("alice".to_string(), "bob".to_string(), "hello UDP".to_string(), Transport::Udp))),
-            ("list alice", Ok(Command::ListUsers("alice".to_string()))),
-            ("disconnect alice", Ok(Command::Disconnect("alice".to_string()))),
-            ("invalid command", Err("Invalid command. Use: register <username>, message <from> <to> <content> [UDP], list <username>, or disconnect <username>")),
-        ];
-
-        for (input, expected_output) in inputs {
-            let result = get_user_input_test(input).await;
-            assert_eq!(result, expected_output);
-        }
-    }
-
-    async fn get_user_input_test(input: &str) -> Result<Command, &'static str> {
-        let input = input.to_string();
-        get_user_input_from_string(input).await
-    }
-
-    async fn get_user_input_from_string(input: String) -> Result<Command, &'static str> {
-        let input = input.trim();
-        get_user_input_impl(input)
-    }
-
-    fn get_user_input_impl(input: &str) -> Result<Command, &'static str> {
-        let parts: Vec<&str> = input.split_whitespace().collect();
-        match parts[0] {
-            "register" if parts.len() == 2 => Ok(Command::Register(parts[1].to_string())),
-            "message" if parts.len() >= 4 => {
-                let from = parts[1].to_string();
-                let to = parts[2].to_string();
-                let content = parts[3..].join(" ");
-                let transport = if parts.last().unwrap() == &"UDP" {
-                    Transport::Udp
-                } else {
-                    Transport::Tcp
-                };
-                Ok(Command::SendMessage(from, to, content, transport))
+            if let Ok(Some(command)) = receive_command(&mut reader) {
+                assert!(matches!(command, Command::Scream(msg) if msg == "Hello, Server!"));
             }
-            "list" if parts.len() == 2 => Ok(Command::ListUsers(parts[1].to_string())),
-            "disconnect" if parts.len() == 2 => Ok(Command::Disconnect(parts[1].to_string())),
-            _ => Err("Invalid command. Use: register <username>, message <from> <to> <content> [UDP], list <username>, or disconnect <username>"),
+
+            send_command(&mut writer, &Command::Scream("Message received".to_string())).unwrap();
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = BufWriter::new(stream);
+
+        send_command(&mut writer, &Command::Register("TestUser".to_string())).unwrap();
+        send_command(&mut writer, &Command::Scream("Hello, Server!".to_string())).unwrap();
+
+        if let Ok(Some(received)) = receive_command(&mut reader) {
+            assert!(matches!(received, Command::Scream(msg) if msg == "Message received"));
+        } else {
+            panic!("Did not receive expected message");
         }
+
+        // Close connection
+        drop(writer);
+        drop(reader);
+
+        // Wait for the server thread to finish (with timeout)
+        server_thread.join().unwrap();
     }
 
-    #[tokio::test]
-    async fn test_handle_command() {
-        let (tx, mut rx) = mpsc::channel(10);
-        let tcp_stream = Arc::new(tokio::sync::Mutex::new(MockTcpStream { tx: tx.clone() }));
-        let udp_socket = MockUdpSocket::new(tx);
-        let mut current_user = None;
+    #[test]
+    fn test_handle_received_file() {
+        // Create a temporary directory for our test files
+        let temp_dir = TempDir::new().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp_dir).unwrap();
 
-        // Test Register command
-        let cmd = Command::Register("alice".to_string());
-        handle_command(cmd, &tcp_stream, &udp_socket, &mut current_user).await.unwrap();
-        assert_eq!(current_user, Some("alice".to_string()));
-        assert_eq!(rx.try_recv().unwrap(), "REGISTER|alice");
+        let sender = "Alice";
+        let filename = "test_file.txt";
+        let content = b"This is a test file content.";
 
-        // Test SendMessage command (TCP)
-        let cmd = Command::SendMessage("alice".to_string(), "bob".to_string(), "hello".to_string(), Transport::Tcp);
-        handle_command(cmd, &tcp_stream, &udp_socket, &mut current_user).await.unwrap();
-        assert_eq!(rx.try_recv().unwrap(), "MESSAGE|alice|bob|hello|TCP");
+        // Test file reception
+        handle_received_file(sender, filename, content).unwrap();
 
-        // Test SendMessage command (UDP)
-        let cmd = Command::SendMessage("alice".to_string(), "bob".to_string(), "hello".to_string(), Transport::Udp);
-        handle_command(cmd, &tcp_stream, &udp_socket, &mut current_user).await.unwrap();
-        assert_eq!(rx.try_recv().unwrap(), "MESSAGE|alice|bob|hello|UDP");
+        // Check if the file was created and has the correct content
+        let file_path = PathBuf::from(filename);
+        assert!(file_path.exists());
+        let saved_content = fs::read(file_path).unwrap();
+        assert_eq!(saved_content, content);
 
-        // Test ListUsers command
-        let cmd = Command::ListUsers("alice".to_string());
-        handle_command(cmd, &tcp_stream, &udp_socket, &mut current_user).await.unwrap();
-        assert_eq!(rx.try_recv().unwrap(), "LIST_USERS|alice");
-
-        // Test Disconnect command
-        let cmd = Command::Disconnect("alice".to_string());
-        handle_command(cmd, &tcp_stream, &udp_socket, &mut current_user).await.unwrap();
-        assert_eq!(current_user, None);
-        assert_eq!(rx.try_recv().unwrap(), "DISCONNECT|alice");
-
-        // Check sent UDP messages
-        let sent_udp_messages = udp_socket.get_sent_messages();
-        assert_eq!(sent_udp_messages, vec!["MESSAGE|alice|bob|hello|UDP"]);
+        // Clean up: change back to the original directory
+        std::env::set_current_dir(original_dir).unwrap();
     }
 
-    struct MockTcpStream {
-        tx: mpsc::Sender<String>,
-    }
+    #[test]
+    fn test_receive_file_command() {
+        // Create a temporary directory for our test files
+        let temp_dir = TempDir::new().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp_dir).unwrap();
 
-    impl AsyncRead for MockTcpStream {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            _buf: &mut ReadBuf<'_>,
-        ) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
+        let sender = "Bob";
+        let filename = "received_file.txt";
+        let content = b"Content of the received file.";
 
-    impl AsyncWrite for MockTcpStream {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<Result<usize, io::Error>> {
-            let msg = String::from_utf8_lossy(buf).to_string();
-            self.tx.try_send(msg).unwrap();
-            Poll::Ready(Ok(buf.len()))
+        let command = Command::SendFile(sender.to_string(), filename.to_string(), content.to_vec());
+
+        // Simulate receiving a file through a command
+        if let Command::SendFile(s, f, c) = command {
+            handle_received_file(&s, &f, &c).unwrap();
         }
 
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-            Poll::Ready(Ok(()))
-        }
+        // Check if the file was created and has the correct content
+        let file_path = PathBuf::from(filename);
+        assert!(file_path.exists());
+        let saved_content = fs::read(file_path).unwrap();
+        assert_eq!(saved_content, content);
 
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-            Poll::Ready(Ok(()))
-        }
+        // Clean up: change back to the original directory
+        std::env::set_current_dir(original_dir).unwrap();
     }
 }

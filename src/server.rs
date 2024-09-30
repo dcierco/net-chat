@@ -1,462 +1,405 @@
+use std::net::{TcpListener, TcpStream};
+use std::io::{BufReader, BufWriter, ErrorKind, Write};
 use std::collections::HashMap;
-use std::future::Future;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::sync::mpsc::{Sender, Receiver};
+use std::time::Duration;
+use log::{info, error, debug};
+use crate::common::{Command, send_command, receive_command,  ServerResponse, send_server_response};
 
-use log::{info, warn, error};
-use tokio::sync::oneshot;
+type ClientMap = Arc<Mutex<HashMap<String, BufWriter<TcpStream>>>>;
 
-// Define AsyncStream trait
-trait AsyncStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
-impl<T: AsyncRead + AsyncWrite + Send + Sync + Unpin> AsyncStream for T {}
-
-#[derive(Debug, Clone)]
-enum Command {
-    Register(String),
-    SendMessage(String, String, String, Transport),
-    ListUsers(String),
-    Disconnect(String),
+pub fn setup_server(address: &str) -> std::io::Result<(ClientMap, Sender<()>)> {
+    info!("Setting up server on {}", address);
+    let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
+    let (tx, _) = std::sync::mpsc::channel();
+    Ok((clients, tx))
 }
 
-#[derive(Debug, Clone)]
-enum Transport {
-    Tcp,
-    Udp,
-}
+pub fn run_server(listener: Arc<TcpListener>, clients: ClientMap, rx: Receiver<()>, set_ctrl_c: bool) {    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let r = running.clone();
 
-impl Command {
-    fn from_str(command: &str) -> Option<Self> {
-        let command = command.trim();
-        let parts: Vec<&str> = command.split('|').collect();
-        match parts[0] {
-            "REGISTER" if parts.len() == 2 => Some(Command::Register(parts[1].to_string())),
-            "MESSAGE" if parts.len() == 5 => Some(Command::SendMessage(
-                parts[1].to_string(),
-                parts[2].to_string(),
-                parts[3].to_string(),
-                Transport::from_str(parts[4])?,
-            )),
-           "LIST_USERS" if parts.len() == 2 => Some(Command::ListUsers(parts[1].to_string())),
-            "DISCONNECT" if parts.len() == 2 => Some(Command::Disconnect(parts[1].to_string())),
-            _ => None,
-        }
-    }
-}
-
-impl Transport {
-    fn from_str(transport: &str) -> Option<Self> {
-        match transport {
-            "TCP" => Some(Transport::Tcp),
-            "UDP" => Some(Transport::Udp),
-            _ => None,
-        }
-    }
-}
-
-struct User {
-    tcp_stream: Option<Arc<Mutex<Box<dyn AsyncStream + Send>>>>,
-    udp_addr: Option<SocketAddr>,
-}
-
-struct Server {
-    online_users: Arc<Mutex<HashMap<String, User>>>,
-    udp_socket: Arc<UdpSocket>,
-}
-
-impl Server {
-    async fn register_user(&self, username: &str, tcp_stream: Option<Arc<Mutex<Box<dyn AsyncStream + Send>>>>, udp_addr: Option<SocketAddr>) -> Result<(), String> {
-        let mut online_users = self.online_users.lock().await;
-        if online_users.contains_key(username) {
-            Err("Username already taken".into())
-        } else {
-            online_users.insert(username.to_string(), User {
-                tcp_stream,
-                udp_addr,
-            });
-            info!("User registered: {}", username);
-            Ok(())
-        }
+    // Set up a ctrl-c handler only if requested
+    if set_ctrl_c {
+        ctrlc::set_handler(move || {
+            println!("Shutting down server...");
+            r.store(false, std::sync::atomic::Ordering::SeqCst);
+        }).expect("Error setting Ctrl-C handler");
     }
 
-    async fn list_users(&self, username: &str) -> String {
-        let online_users = self.online_users.lock().await;
-        if !online_users.contains_key(username) {
-            return "LIST_USERS|FAILURE|User not registered".into();
-        }
-        let users = online_users.keys().cloned().collect::<Vec<_>>().join(",");
-        info!("Listed users for: {}", username);
-        format!("LIST_USERS|SUCCESS|{}", users)
-    }
+    // Set the listener to non-blocking mode
+    listener.set_nonblocking(true).expect("Cannot set non-blocking");
 
-    async fn disconnect(&self, username: &str) -> String {
-        let mut online_users = self.online_users.lock().await;
-        if online_users.remove(username).is_some() {
-            info!("User disconnected: {}", username);
-            "DISCONNECT|SUCCESS".into()
-        } else {
-            "DISCONNECT|FAILURE|User not registered".into()
-        }
-    }
-
-    async fn send_message(&self, from: &str, to: &str, content: &str, transport: &Transport) -> Result<(), String> {
-        println!("Entering send_message: from={}, to={}, content={:?}, transport={:?}", from, to, content, transport);
-
-        let (sender_stream, receiver_stream, receiver_udp_addr) = {
-            let online_users = self.online_users.lock().await;
-            println!("Acquired online_users lock");
-
-            let sender = online_users.get(from).ok_or_else(|| format!("Sender {} not registered", from))?;
-            let receiver = online_users.get(to).ok_or_else(|| format!("Recipient {} not online", to))?;
-
-            (sender.tcp_stream.clone(), receiver.tcp_stream.clone(), receiver.udp_addr)
-        };
-        println!("Released online_users lock");
-
-        let message = format!("MESSAGE|{}|{}\n", from, content);
-
-        match transport {
-            Transport::Tcp => {
-                if let Some(tcp_stream) = receiver_stream {
-                    println!("Attempting to acquire receiver's socket lock");
-                    let mut locked_stream = tcp_stream.lock().await;
-                    println!("Acquired receiver's socket lock");
-                    locked_stream.write_all(message.as_bytes()).await.map_err(|e| e.to_string())?;
-                    println!("Message written to receiver's socket");
-                    locked_stream.flush().await.map_err(|e| e.to_string())?;
-                    println!("Message flushed to receiver's socket");
-                } else {
-                    return Err(format!("Recipient {} does not have a TCP stream", to));
-                }
-            }
-            Transport::Udp => {
-                if let Some(udp_addr) = receiver_udp_addr {
-                    self.udp_socket.send_to(message.as_bytes(), udp_addr).await.map_err(|e| e.to_string())?;
-                } else {
-                    return Err(format!("Recipient {} does not have a UDP address", to));
-                }
-            }
-        }
-
-        // Send confirmation back to the sender
-        if let Some(tcp_stream) = sender_stream {
-            let confirmation = format!("MESSAGE|SUCCESS\n");
-            let mut locked_stream = tcp_stream.lock().await;
-            locked_stream.write_all(confirmation.as_bytes()).await.map_err(|e| e.to_string())?;
-            locked_stream.flush().await.map_err(|e| e.to_string())?;
-        }
-
-        Ok(())
-    }
-
-    async fn handle_command(&self, command: Command, tcp_stream: Option<Arc<Mutex<Box<dyn AsyncStream + Send>>>>, udp_addr: Option<SocketAddr>) -> (String, Option<String>) {
-        match command {
-            Command::Register(username) => {
-                match self.register_user(&username, tcp_stream, udp_addr).await {
-                    Ok(_) => ("REGISTER|SUCCESS".into(), None),
-                    Err(err) => (format!("REGISTER|FAILURE|{}", err), None),
-                }
-            }
-            Command::SendMessage(from, to, content, transport) => {
-                match self.send_message(&from, &to, &content, &transport).await {
-                    Ok(_) => ("MESSAGE|SUCCESS".into(), None),
-                    Err(err) => (format!("MESSAGE|FAILURE|{}", err), None),
-                }
-            }
-            Command::ListUsers(username) => {
-                (self.list_users(&username).await, None)
-            }
-            Command::Disconnect(username) => {
-                (self.disconnect(&username).await, None)
-            }
-        }
-    }
-
-    async fn handle_tcp_connection(self: Arc<Self>, socket: TcpStream) {
-        let socket: Arc<Mutex<Box<dyn AsyncStream + Send>>> = Arc::new(Mutex::new(Box::new(socket)));
-        let mut buffer = [0; 2048];
-        let username = String::new();
-
-        loop {
-            let n = match socket.lock().await.read(&mut buffer).await {
-                Ok(n) if n == 0 => {
-                    break;
-                }
-                Ok(n) => n,
-                Err(e) => {
-                    error!("Failed to read from socket; err = {:?}", e);
-                    break;
-                }
-            };
-
-            let command_str = String::from_utf8_lossy(&buffer[..n]);
-            if let Some(command) = Command::from_str(&command_str) {
-                println!("Received command: {:?}", command);
-                let (response, _) = self.handle_command(command, Some(socket.clone()), None).await;
-                println!("Sending response: {}", response);
-                if let Err(e) = socket.lock().await.write_all(response.as_bytes()).await {
-                    error!("Failed to write to socket; err = {:?}", e);
-                    break;
-                }
-            }
-        }
-
-        info!("TCP connection closed for user: {}", username);
-        if !username.is_empty() {
-            self.disconnect(&username).await;
-        }
-    }
-
-    async fn handle_udp_socket(self: Arc<Self>) {
-        let mut buffer = [0; 2048];
-        loop {
-            match self.udp_socket.recv_from(&mut buffer).await {
-                Ok((n, addr)) => {
-                    let command_str = String::from_utf8_lossy(&buffer[..n]);
-                    if let Some(command) = Command::from_str(&command_str) {
-                        let (response, _) = self.handle_command(command, None, Some(addr)).await;
-                        if let Err(e) = self.udp_socket.send_to(response.as_bytes(), addr).await {
-                            warn!("Failed to send UDP response; err = {:?}", e);
-                        }
+    while running.load(std::sync::atomic::Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((stream, addr)) => {
+                info!("New connection: {}", addr);
+                let clients = Arc::clone(&clients);
+                let running = Arc::clone(&running);
+                thread::spawn(move || {
+                    if let Err(e) = handle_client(stream, clients, running) {
+                        error!("Error handling client {}: {}", addr, e);
                     }
-                },
-                Err(e) => {
-                    warn!("UDP receive error: {:?}", e);
-                },
-            }
-        }
-    }
-}
-
-pub async fn run_server(shutdown: impl Future<Output = ()> + Send + 'static) -> io::Result<()> {
-    env_logger::init();
-
-    let online_users = Arc::new(Mutex::new(HashMap::new()));
-    let udp_socket = Arc::new(UdpSocket::bind("127.0.0.1:8081").await?);
-
-    let server = Arc::new(Server {
-        online_users,
-        udp_socket: udp_socket.clone(),
-    });
-
-    let tcp_listener = TcpListener::bind("127.0.0.1:8080").await?;
-
-    let tcp_server = server.clone();
-    let tcp_handle = tokio::spawn(async move {
-        loop {
-            if let Ok((socket, _)) = tcp_listener.accept().await {
-                let tcp_server = tcp_server.clone();
-                tokio::spawn(async move {
-                    tcp_server.handle_tcp_connection(socket).await;
                 });
             }
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                // No pending connections, sleep for a short while
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                error!("Error accepting connection: {}", e);
+            }
         }
-    });
-    info!("TCP server running on 127.0.0.1:8080");
 
-    let udp_server = server.clone();
-    let udp_handle = tokio::spawn(async move {
-        udp_server.handle_udp_socket().await;
-    });
-    info!("UDP server running on 127.0.0.1:8081");
-
-    // Wait for both TCP and UDP handlers
-    tokio::select! {
-        _ = tcp_handle => {},
-        _ = udp_handle => {},
-        _ = shutdown => {
-            info!("Server shutting down");
-        },
+        // Check for shutdown signal
+        if rx.try_recv().is_ok() {
+            info!("Shutdown signal received");
+            break;
+        }
     }
 
+    info!("Server shutting down");
+}
+
+fn handle_client(stream: TcpStream, clients: ClientMap, running: Arc<std::sync::atomic::AtomicBool>) -> std::io::Result<()> {    stream.set_nonblocking(false)?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut writer = BufWriter::new(stream);
+    let mut name = String::new();
+
+    while running.load(std::sync::atomic::Ordering::SeqCst) {
+        match receive_command(&mut reader)? {
+            Some(command) => {
+                debug!("Received command: {:?}", command);
+                match command {
+                    Command::Register(client_name) => {
+                        name = client_name.clone();
+                        clients.lock().unwrap().insert(client_name, BufWriter::new(writer.get_ref().try_clone()?));
+                        info!("Registered client: {}", name);
+                        send_server_response(&mut writer, &ServerResponse::RegistrationSuccessful)?;
+                    }
+                    Command::Scream(message) => {
+                        if name.is_empty() {
+                            send_command(&mut writer, &Command::Scream("Please register first".to_string()))?;
+                            writer.flush()?;
+                        } else {
+                            info!("Received broadcast from {}: {}", name, message);
+                            broadcast_message(&clients, &name, &message)?;
+                        }
+                    }
+                    Command::Whisper(recipient, message) => {
+                        if name.is_empty() {
+                            send_command(&mut writer, &Command::Scream("Please register first".to_string()))?;
+                            writer.flush()?;
+                        } else {
+                            info!("Received whisper from {} to {}: {}", name, recipient, message);
+                            whisper_message(&clients, &name, &recipient, &message)?;
+                        }
+                    }
+                    Command::SendFile(recipient, filename, content) => {
+                        if name.is_empty() {
+                            send_server_response(&mut writer, &ServerResponse::Message("Please register first".to_string()))?;
+                        } else {
+                            handle_file_transfer(&clients, &name, &recipient, &filename, &content, &mut writer)?;
+                        }
+                    }
+                    Command::ListUsers => {
+                        let user_list: Vec<String> = clients.lock().unwrap().keys().cloned().collect();
+                        send_server_response(&mut writer, &ServerResponse::UserList(user_list))?;
+                        writer.flush()?;
+                    }
+                    Command::Disconnect => {
+                        info!("Client {} disconnected", name);
+                        clients.lock().unwrap().remove(&name);
+                        break;
+                    }
+                }
+            }
+            None => {
+                if !name.is_empty() {
+                    info!("Client {} disconnected unexpectedly", name);
+                    clients.lock().unwrap().remove(&name);
+                }
+                break;
+            }
+        }
+    }
     Ok(())
 }
 
-#[tokio::main]
-pub async fn main() -> io::Result<()> {
-    let (_, shutdown_receiver) = oneshot::channel::<()>();
+fn broadcast_message(clients: &ClientMap, sender: &str, message: &str) -> std::io::Result<()> {
+    let broadcast_message = format!("{}: {}", sender, message);
+    let mut clients = clients.lock().unwrap();
+    for (client_name, client_writer) in clients.iter_mut() {
+        if client_name != sender {
+            send_command(client_writer, &Command::Scream(broadcast_message.clone()))?;
+            client_writer.flush()?;
+        }
+    }
+    Ok(())
+}
 
-    // Create a never-ending future
-    let shutdown_future = async {
-        let _ = shutdown_receiver.await;
-    };
+fn whisper_message(clients: &ClientMap, sender: &str, recipient: &str, message: &str) -> std::io::Result<()> {
+    let mut clients = clients.lock().unwrap();
+    if let Some(client_writer) = clients.get_mut(recipient) {
+        send_command(client_writer, &Command::Whisper(sender.to_string(), message.to_string()))?;
+        client_writer.flush()?;
+        Ok(())
+    } else {
+        let sender_writer = clients.get_mut(sender).unwrap();
+        send_server_response(sender_writer, &ServerResponse::Message(format!("User {} not found", recipient)))?;
+        sender_writer.flush()?;
+        Ok(())
+    }
+}
 
-    run_server(shutdown_future).await
+fn handle_file_transfer(
+    clients: &ClientMap,
+    sender: &str,
+    recipient: &str,
+    filename: &str,
+    content: &[u8],
+    writer: &mut impl Write,
+) -> std::io::Result<()> {
+    let mut clients = clients.lock().unwrap();
+    if let Some(recipient_writer) = clients.get_mut(recipient) {
+        send_server_response(recipient_writer, &ServerResponse::FileTransferStarted(filename.to_string()))?;
+        send_command(recipient_writer, &Command::SendFile(sender.to_string(), filename.to_string(), content.to_vec()))?;
+        send_server_response(recipient_writer, &ServerResponse::FileTransferComplete(filename.to_string()))?;
+        recipient_writer.flush()?;
+        send_server_response(writer, &ServerResponse::Message(format!("File sent to {}", recipient)))?;
+    } else {
+        send_server_response(writer, &ServerResponse::FileTransferFailed(format!("User {} not found", recipient)))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::mpsc::{self, UnboundedSender};
-    use tokio::time::timeout;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
+    use crate::initialize;
+    use std::net::TcpStream;
+    use std::thread;
     use std::time::Duration;
-    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use std::io::Write;
+    use std::sync::mpsc::channel;
+    use crate::common::receive_message;
 
-    async fn create_test_server() -> Arc<Server> {
-        let online_users = Arc::new(Mutex::new(HashMap::new()));
-        let udp_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        Arc::new(Server {
-            online_users,
-            udp_socket,
-        })
-    }
-
-    struct MockTcpStream {
-        username: String,
-        tx: UnboundedSender<String>,
-    }
-
-    impl AsyncRead for MockTcpStream {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            _buf: &mut ReadBuf<'_>,
-        ) -> Poll<io::Result<()>> {
-            println!("MockTcpStream({}): poll_read called", self.username);
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    impl AsyncWrite for MockTcpStream {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<Result<usize, io::Error>> {
-            let msg = String::from_utf8_lossy(buf).to_string();
-            println!("MockTcpStream({}): poll_write called with message: {}", self.username, msg);
-            if let Err(_) = self.tx.send(msg) {
-                println!("MockTcpStream({}): Failed to send message", self.username);
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "Failed to send")));
-            }
-            Poll::Ready(Ok(buf.len()))
-        }
-
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-            println!("MockTcpStream({}): poll_flush called", self.username);
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-            println!("MockTcpStream({}): poll_shutdown called", self.username);
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    #[tokio::test]
-    async fn test_register_user() {
-        let server = create_test_server().await;
-        let result = server.register_user("alice", None, None).await;
-        assert!(result.is_ok());
-
-        let result = server.register_user("alice", None, None).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_list_users() {
-        let server = create_test_server().await;
-        server.register_user("alice", None, None).await.unwrap();
-        server.register_user("bob", None, None).await.unwrap();
-
-        let result = server.list_users("alice").await;
-        assert!(result.contains("alice"));
-        assert!(result.contains("bob"));
-
-        let result = server.list_users("charlie").await;
-        assert!(result.contains("FAILURE"));
-    }
-
-    #[tokio::test]
-    async fn test_disconnect() {
-        let server = create_test_server().await;
-        server.register_user("alice", None, None).await.unwrap();
-
-        let result = server.disconnect("alice").await;
-        assert_eq!(result, "DISCONNECT|SUCCESS");
-
-        let result = server.disconnect("alice").await;
-        assert!(result.contains("FAILURE"));
-    }
-
-    #[tokio::test]
-    async fn test_send_message_tcp() {
-        let server = create_test_server().await;
-        let (alice_tx, mut alice_rx) = mpsc::unbounded_channel();
-        let (bob_tx, mut bob_rx) = mpsc::unbounded_channel();
-
-        let alice_stream: Arc<Mutex<Box<dyn AsyncStream + Send>>> = Arc::new(Mutex::new(Box::new(MockTcpStream {
-            username: "alice".to_string(),
-            tx: alice_tx,
-        })));
-        let bob_stream: Arc<Mutex<Box<dyn AsyncStream + Send>>> = Arc::new(Mutex::new(Box::new(MockTcpStream {
-            username: "bob".to_string(),
-            tx: bob_tx,
-        })));
-
-        println!("Registering users...");
-        server.register_user("alice", Some(alice_stream.clone()), None).await.unwrap();
-        server.register_user("bob", Some(bob_stream.clone()), None).await.unwrap();
-        println!("Users registered");
-
-        // Add a small delay to ensure everything is set up
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        println!("Sending message...");
-        let send_result = timeout(Duration::from_secs(10), server.send_message("bob", "alice", "Hello", &Transport::Tcp)).await;
-
-        match send_result {
-            Ok(result) => {
-                match result {
-                    Ok(_) => println!("Message sent successfully"),
-                    Err(e) => {
-                        eprintln!("send_message error: {}", e);
-                        assert!(false, "send_message failed: {}", e);
-                    }
-                }
-            },
-            Err(_) => {
-                eprintln!("send_message timed out");
-                assert!(false, "send_message timed out");
+    // In the tests module, add this function:
+    fn connect_with_retry(addr: std::net::SocketAddr, max_attempts: u32) -> std::io::Result<TcpStream> {
+        for attempt in 1..=max_attempts {
+            match TcpStream::connect(addr) {
+                Ok(stream) => return Ok(stream),
+                Err(e) if attempt == max_attempts => return Err(e),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
             }
         }
+        unreachable!()
+    }
 
-        println!("Waiting for Alice to receive the message...");
-        match timeout(Duration::from_secs(5), alice_rx.recv()).await {
-            Ok(Some(received)) => {
-                println!("Alice received: {}", received);
-                assert_eq!(received, "MESSAGE|bob|Hello\n");
-            },
-            Ok(None) => {
-                eprintln!("Alice's channel closed unexpectedly");
-                assert!(false, "Alice's channel closed unexpectedly");
-            },
-            Err(_) => {
-                eprintln!("Timed out waiting for Alice to receive the message");
-                assert!(false, "Timed out waiting for Alice to receive the message");
+    #[test]
+    fn test_multiple_clients() {
+        initialize();
+
+        let (tx, rx) = channel();
+        let (shutdown_tx, shutdown_rx) = channel();
+
+        let server_thread = thread::spawn(move || {
+            let listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
+            let addr = listener.local_addr().unwrap();
+            println!("Server bound to: {:?}", addr);
+            tx.send(addr).unwrap();
+            let (clients, _) = setup_server(&addr.to_string()).unwrap();
+            run_server(Arc::clone(&listener), clients, shutdown_rx, false); // Note the 'false' here
+        });
+
+        // Wait for the server to start and get its address
+        let server_addr = rx.recv().unwrap();
+        println!("Server started on: {:?}", server_addr);
+
+        // Give the server some time to fully initialize
+        thread::sleep(Duration::from_millis(100));
+
+        println!("Attempting to connect client 1");
+        let client1 = connect_with_retry(server_addr, 5).unwrap();
+        println!("Client 1 connected");
+
+        println!("Attempting to connect client 2");
+        let client2 = connect_with_retry(server_addr, 5).unwrap();
+        println!("Client 2 connected");
+
+        client1.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        client2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+        let mut reader1 = BufReader::new(client1.try_clone().unwrap());
+        let mut reader2 = BufReader::new(client2.try_clone().unwrap());
+        let mut writer1 = BufWriter::new(client1);
+        let mut writer2 = BufWriter::new(client2);
+
+        println!("Registering clients");
+        send_command(&mut writer1, &Command::Register("Alice".to_string())).unwrap();
+        writer1.flush().unwrap();
+        send_command(&mut writer2, &Command::Register("Bob".to_string())).unwrap();
+        writer2.flush().unwrap();
+
+        println!("Waiting for registration confirmation");
+        let reg_confirm1 = receive_command(&mut reader1);
+        let reg_confirm2 = receive_command(&mut reader2);
+        println!("Registration confirmations: {:?}, {:?}", reg_confirm1, reg_confirm2);
+
+        println!("Sending message from Alice");
+        send_command(&mut writer1, &Command::Scream("Hello, Bob!".to_string())).unwrap();
+        writer1.flush().unwrap();
+
+        println!("Waiting for Bob to receive the message");
+        let received = receive_command(&mut reader2);
+        println!("Bob received: {:?}", received);
+
+        assert!(matches!(received, Ok(Some(Command::Scream(msg))) if msg == "Alice: Hello, Bob!"));
+
+        // Disconnect clients
+        println!("Disconnecting clients");
+        send_command(&mut writer1, &Command::Disconnect).unwrap();
+        send_command(&mut writer2, &Command::Disconnect).unwrap();
+
+        // Close connections
+        drop(writer1);
+        drop(writer2);
+
+        // Stop the server
+        println!("Shutting down the server");
+        shutdown_tx.send(()).unwrap();
+
+        // Wait for the server thread to finish
+        server_thread.join().unwrap();
+        println!("Server shut down successfully");
+    }
+
+    #[test]
+    fn test_list_users() {
+        initialize();
+
+        let (tx, rx) = channel();
+        let (shutdown_tx, shutdown_rx) = channel();
+
+        let server_thread = thread::spawn(move || {
+            let listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
+            let addr = listener.local_addr().unwrap();
+            tx.send(addr).unwrap();
+            let (clients, _) = setup_server(&addr.to_string()).unwrap();
+            run_server(Arc::clone(&listener), clients, shutdown_rx, false); // Note the 'false' here
+        });
+
+        let server_addr = rx.recv().unwrap();
+        thread::sleep(Duration::from_millis(100));
+
+        let client1 = connect_with_retry(server_addr, 5).unwrap();
+        let client2 = connect_with_retry(server_addr, 5).unwrap();
+
+        let mut reader1 = BufReader::new(client1.try_clone().unwrap());
+        let mut reader2 = BufReader::new(client2.try_clone().unwrap());
+        let mut writer1 = BufWriter::new(client1.try_clone().unwrap());
+        let mut writer2 = BufWriter::new(client2.try_clone().unwrap());
+
+        // Register clients
+        send_command(&mut writer1, &Command::Register("Alice".to_string())).unwrap();
+        writer1.flush().unwrap();
+        send_command(&mut writer2, &Command::Register("Bob".to_string())).unwrap();
+        writer2.flush().unwrap();
+
+        // Wait for registration confirmations
+        assert!(matches!(receive_message(&mut reader1), Ok(Some(Err(ServerResponse::RegistrationSuccessful)))));
+        assert!(matches!(receive_message(&mut reader2), Ok(Some(Err(ServerResponse::RegistrationSuccessful)))));
+
+        // Request user list
+        send_command(&mut writer1, &Command::ListUsers).unwrap();
+        writer1.flush().unwrap();
+
+        // Check the response
+        match receive_message(&mut reader1) {
+            Ok(Some(Err(ServerResponse::UserList(users)))) => {
+                assert!(users.contains(&"Alice".to_string()));
+                assert!(users.contains(&"Bob".to_string()));
+                assert_eq!(users.len(), 2);
             }
+            other => panic!("Did not receive expected UserList response. Got: {:?}", other),
         }
 
-        println!("Waiting for Bob to receive the confirmation...");
-        match timeout(Duration::from_secs(5), bob_rx.recv()).await {
-            Ok(Some(received)) => {
-                println!("Bob received: {}", received);
-                assert_eq!(received, "MESSAGE|SUCCESS\n");
-            },
-            Ok(None) => {
-                eprintln!("Bob's channel closed unexpectedly");
-                assert!(false, "Bob's channel closed unexpectedly");
-            },
-            Err(_) => {
-                eprintln!("Timed out waiting for Bob to receive the confirmation");
-                assert!(false, "Timed out waiting for Bob to receive the confirmation");
-            }
+        // Disconnect clients
+        send_command(&mut writer1, &Command::Disconnect).unwrap();
+        writer1.flush().unwrap();
+        send_command(&mut writer2, &Command::Disconnect).unwrap();
+        writer2.flush().unwrap();
+
+        // Stop the server
+        shutdown_tx.send(()).unwrap();
+        server_thread.join().unwrap();
+    }
+
+#[test]
+    fn test_file_transfer() {
+        initialize();
+
+        let (tx, rx) = channel();
+        let (shutdown_tx, shutdown_rx) = channel();
+
+        let server_thread = thread::spawn(move || {
+            let listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
+            let addr = listener.local_addr().unwrap();
+            tx.send(addr).unwrap();
+            let (clients, _) = setup_server(&addr.to_string()).unwrap();
+            run_server(Arc::clone(&listener), clients, shutdown_rx, false);
+        });
+
+        let server_addr = rx.recv().unwrap();
+        thread::sleep(Duration::from_millis(100));
+
+        let client1 = connect_with_retry(server_addr, 5).unwrap();
+        let client2 = connect_with_retry(server_addr, 5).unwrap();
+
+        let mut reader1 = BufReader::new(client1.try_clone().unwrap());
+        let mut reader2 = BufReader::new(client2.try_clone().unwrap());
+        let mut writer1 = BufWriter::new(client1.try_clone().unwrap());
+        let mut writer2 = BufWriter::new(client2.try_clone().unwrap());
+
+        // Register clients
+        send_command(&mut writer1, &Command::Register("Alice".to_string())).unwrap();
+        send_command(&mut writer2, &Command::Register("Bob".to_string())).unwrap();
+
+        // Wait for registration confirmations
+        assert!(matches!(receive_message(&mut reader1), Ok(Some(Err(ServerResponse::RegistrationSuccessful)))));
+        assert!(matches!(receive_message(&mut reader2), Ok(Some(Err(ServerResponse::RegistrationSuccessful)))));
+
+        // Send a file from Alice to Bob
+        let test_content = b"Hello, this is a test file content.";
+        send_command(&mut writer1, &Command::SendFile("Bob".to_string(), "test.txt".to_string(), test_content.to_vec())).unwrap();
+
+        // Check Bob's received file
+        match receive_message(&mut reader2) {
+            Ok(Some(Err(ServerResponse::FileTransferStarted(filename)))) => assert_eq!(filename, "test.txt"),
+            other => panic!("Unexpected response: {:?}", other),
         }
 
-        println!("Test completed");
+        match receive_message(&mut reader2) {
+            Ok(Some(Ok(Command::SendFile(sender, filename, content)))) => {
+                assert_eq!(sender, "Alice");
+                assert_eq!(filename, "test.txt");
+                assert_eq!(content, test_content);
+            }
+            other => panic!("Unexpected response: {:?}", other),
+        }
+
+        match receive_message(&mut reader2) {
+            Ok(Some(Err(ServerResponse::FileTransferComplete(filename)))) => assert_eq!(filename, "test.txt"),
+            other => panic!("Unexpected response: {:?}", other),
+        }
+
+        // Disconnect clients
+        send_command(&mut writer1, &Command::Disconnect).unwrap();
+        send_command(&mut writer2, &Command::Disconnect).unwrap();
+
+        // Stop the server
+        shutdown_tx.send(()).unwrap();
+        server_thread.join().unwrap();
     }
 }

@@ -1,24 +1,35 @@
+use net_chat::common::{receive_command, send_command, Command};
 use net_chat::{initialize, server};
-use net_chat::common::{Command, send_command, receive_command};
+use std::collections::HashMap;
+use std::io::{BufReader, BufWriter};
+use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::sync::mpsc::channel;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use std::net::{TcpStream, TcpListener};
-use std::sync::{mpsc, Arc};
-use std::io::{BufReader, BufWriter};
 
 #[test]
 fn test_multiple_clients() {
     initialize();
 
-    let (tx, rx) = mpsc::channel();
-    let (shutdown_tx, shutdown_rx) = mpsc::channel();
+    let (tx, rx) = channel();
+    let (shutdown_tx, shutdown_rx) = channel();
 
     let server_thread = thread::spawn(move || {
-        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
-        let addr = listener.local_addr().unwrap();
+        let tcp_listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
+        let addr = tcp_listener.local_addr().unwrap();
+        let udp_socket = Arc::new(UdpSocket::bind(addr).unwrap());
         tx.send(addr).unwrap();
         let (clients, _) = server::setup_server(&addr.to_string()).unwrap();
-        server::run_server(Arc::clone(&listener), clients, shutdown_rx, true);
+        let udp_clients = Arc::new(Mutex::new(HashMap::new()));
+        server::run_server(
+            tcp_listener,
+            udp_socket,
+            clients,
+            udp_clients,
+            shutdown_rx,
+            false,
+        );
     });
 
     let server_addr = rx.recv().unwrap();
@@ -28,8 +39,12 @@ fn test_multiple_clients() {
     let client1 = TcpStream::connect(server_addr).unwrap();
     let client2 = TcpStream::connect(server_addr).unwrap();
 
-    client1.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    client2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    client1
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    client2
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
 
     let mut reader1 = BufReader::new(client1.try_clone().unwrap());
     let mut reader2 = BufReader::new(client2.try_clone().unwrap());

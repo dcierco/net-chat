@@ -10,15 +10,15 @@ fn main() {
     env_logger::init();
 
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        println!("Usage: {} <server|client>", args[0]);
+    if args.len() < 3 {
+        println!("Usage: {} <server|client> <server_address> [udp]", args[0]);
         return;
     }
 
     match args[1].as_str() {
         "server" => {
             info!("Starting server");
-            let address = "127.0.0.1:8080";
+            let address = "0.0.0.0:8080";
             let tcp_listener =
                 Arc::new(TcpListener::bind(address).expect("Failed to bind to address"));
             let udp_socket = Arc::new(UdpSocket::bind(address).expect("Failed to bind UDP socket"));
@@ -38,8 +38,9 @@ fn main() {
             );
         }
         "client" => {
+            let server_address = &args[2];
             let use_udp = args.get(3).map_or(false, |arg| arg == "udp");
-            if let Err(e) = net_chat::client::start_client("127.0.0.1:8080", use_udp) {
+            if let Err(e) = net_chat::client::start_client(server_address, use_udp) {
                 eprintln!("Client error: {}", e);
             }
         }

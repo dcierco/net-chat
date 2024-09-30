@@ -2,12 +2,30 @@ use crate::common::{receive_message, send_command, send_file, Command, ServerRes
 use log::{error, info};
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, UdpSocket};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-pub fn start_client(address: &str) -> std::io::Result<()> {
+pub fn start_client(address: &str, use_udp: bool) -> std::io::Result<()> {
+    if use_udp {
+        start_udp_client(address)
+    } else {
+        start_tcp_client(address)
+    }
+}
+
+fn start_udp_client(address: &str) -> std::io::Result<()> {
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.connect(address)?;
+
+    // Implement UDP client logic similar to TCP, but using socket.send() and socket.recv_from()
+    // ...
+    println!("UDP client connected to {}", address);
+    Ok(())
+}
+
+pub fn start_tcp_client(address: &str) -> std::io::Result<()> {
     info!("Connecting to server at {}", address);
     let stream = TcpStream::connect(address)?;
     let reader = BufReader::new(stream.try_clone()?);
@@ -225,7 +243,8 @@ mod tests {
     fn test_handle_received_file() {
         // Create a temporary directory for our test files
         let temp_dir = TempDir::new().unwrap();
-        let original_dir = std::env::current_dir().unwrap();
+
+        // Change the current working directory to the temporary directory
         std::env::set_current_dir(&temp_dir).unwrap();
 
         let sender = "Alice";
@@ -236,13 +255,10 @@ mod tests {
         handle_received_file(sender, filename, content).unwrap();
 
         // Check if the file was created and has the correct content
-        let file_path = PathBuf::from(filename);
-        assert!(file_path.exists());
-        let saved_content = fs::read(file_path).unwrap();
+        let file_path = temp_dir.path().join(filename);
+        assert!(file_path.exists(), "File does not exist: {:?}", file_path);
+        let saved_content = std::fs::read(&file_path).unwrap();
         assert_eq!(saved_content, content);
-
-        // Clean up: change back to the original directory
-        std::env::set_current_dir(original_dir).unwrap();
     }
 
     #[test]

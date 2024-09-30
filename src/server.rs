@@ -1,9 +1,10 @@
 use crate::common::{receive_command, send_command, send_server_response, Command, ServerResponse};
+use crate::udp::run_udp_server;
 use log::{debug, error, info};
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::{BufReader, BufWriter, ErrorKind, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufReader, BufWriter, Write};
+use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -19,13 +20,27 @@ pub fn setup_server(address: &str) -> std::io::Result<(ClientMap, Sender<()>)> {
 }
 
 pub fn run_server(
-    listener: Arc<TcpListener>,
+    tcp_listener: Arc<TcpListener>,
+    udp_socket: Arc<UdpSocket>,
     clients: ClientMap,
+    udp_clients: Arc<Mutex<HashMap<String, std::net::SocketAddr>>>,
     rx: Receiver<()>,
     set_ctrl_c: bool,
 ) {
     let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let r = running.clone();
+
+    // Spawn a new thread for UDP handling
+    let udp_clients_clone = Arc::clone(&udp_clients);
+    let udp_socket_clone = Arc::clone(&udp_socket);
+    let running_udp = Arc::clone(&running);
+    thread::spawn(move || {
+        if let Ok(socket) = (*udp_socket_clone).try_clone() {
+            run_udp_server(socket, udp_clients_clone, running_udp);
+        } else {
+            error!("Failed to clone UDP socket for UDP server thread");
+        }
+    });
 
     // Set up a ctrl-c handler only if requested
     if set_ctrl_c {
@@ -37,12 +52,12 @@ pub fn run_server(
     }
 
     // Set the listener to non-blocking mode
-    listener
+    tcp_listener
         .set_nonblocking(true)
         .expect("Cannot set non-blocking");
 
     while running.load(std::sync::atomic::Ordering::SeqCst) {
-        match listener.accept() {
+        match tcp_listener.accept() {
             Ok((stream, addr)) => {
                 info!("New connection: {}", addr);
                 let clients = Arc::clone(&clients);
@@ -53,7 +68,7 @@ pub fn run_server(
                     }
                 });
             }
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // No pending connections, sleep for a short while
                 thread::sleep(Duration::from_millis(10));
             }
@@ -264,9 +279,10 @@ mod tests {
     use crate::initialize;
     use std::io::Write;
     use std::net::TcpStream;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::channel;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     // In the tests module, add this function:
     fn connect_with_retry(
@@ -291,11 +307,20 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = channel();
 
         let server_thread = thread::spawn(move || {
-            let listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
-            let addr = listener.local_addr().unwrap();
+            let tcp_listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
+            let addr = tcp_listener.local_addr().unwrap();
+            let udp_socket = Arc::new(UdpSocket::bind(addr).unwrap());
             tx.send(addr).unwrap();
             let (clients, _) = setup_server(&addr.to_string()).unwrap();
-            run_server(Arc::clone(&listener), clients, shutdown_rx, false);
+            let udp_clients = Arc::new(Mutex::new(HashMap::new()));
+            run_server(
+                Arc::clone(&tcp_listener),
+                Arc::clone(&udp_socket),
+                clients,
+                udp_clients,
+                shutdown_rx,
+                false,
+            );
         });
 
         let server_addr = rx.recv().unwrap();
@@ -350,11 +375,20 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = channel();
 
         let server_thread = thread::spawn(move || {
-            let listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
-            let addr = listener.local_addr().unwrap();
+            let tcp_listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
+            let addr = tcp_listener.local_addr().unwrap();
+            let udp_socket = Arc::new(UdpSocket::bind(addr).unwrap());
             tx.send(addr).unwrap();
             let (clients, _) = setup_server(&addr.to_string()).unwrap();
-            run_server(Arc::clone(&listener), clients, shutdown_rx, false); // Note the 'false' here
+            let udp_clients = Arc::new(Mutex::new(HashMap::new()));
+            run_server(
+                Arc::clone(&tcp_listener),
+                Arc::clone(&udp_socket),
+                clients,
+                udp_clients,
+                shutdown_rx,
+                false,
+            );
         });
 
         let server_addr = rx.recv().unwrap();
@@ -421,11 +455,20 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = channel();
 
         let server_thread = thread::spawn(move || {
-            let listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
-            let addr = listener.local_addr().unwrap();
+            let tcp_listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
+            let addr = tcp_listener.local_addr().unwrap();
+            let udp_socket = Arc::new(UdpSocket::bind(addr).unwrap());
             tx.send(addr).unwrap();
             let (clients, _) = setup_server(&addr.to_string()).unwrap();
-            run_server(Arc::clone(&listener), clients, shutdown_rx, false);
+            let udp_clients = Arc::new(Mutex::new(HashMap::new()));
+            run_server(
+                Arc::clone(&tcp_listener),
+                Arc::clone(&udp_socket),
+                clients,
+                udp_clients,
+                shutdown_rx,
+                false,
+            );
         });
 
         let server_addr = rx.recv().unwrap();
@@ -496,5 +539,68 @@ mod tests {
         // Stop the server
         shutdown_tx.send(()).unwrap();
         server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_udp_client_registration() {
+        initialize();
+
+        let server_addr = "127.0.0.1:0";
+        let udp_socket = Arc::new(UdpSocket::bind(server_addr).unwrap());
+        let server_addr = udp_socket.local_addr().unwrap();
+        let udp_clients = Arc::new(Mutex::new(HashMap::new()));
+        let running = Arc::new(AtomicBool::new(true));
+        let running_clone = Arc::clone(&running);
+
+        let server_thread = thread::spawn(move || {
+            run_udp_server(
+                (*udp_socket).try_clone().unwrap(),
+                udp_clients,
+                running_clone,
+            );
+        });
+
+        // Give the server a moment to start
+        thread::sleep(Duration::from_millis(100));
+
+        // Create a UDP client
+        let client_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client_socket.connect(server_addr).unwrap();
+        client_socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        // Send registration command
+        let register_command = Command::Register("TestUser".to_string());
+        let serialized = serde_json::to_string(&register_command).unwrap();
+        client_socket.send(serialized.as_bytes()).unwrap();
+
+        // Receive response
+        let mut buf = [0; 1024];
+        match client_socket.recv(&mut buf) {
+            Ok(size) => {
+                let response: ServerResponse = serde_json::from_slice(&buf[..size]).unwrap();
+                assert!(matches!(response, ServerResponse::RegistrationSuccessful));
+            }
+            Err(e) => panic!("Failed to receive response: {}", e),
+        }
+
+        // Clean up
+        running.store(false, Ordering::Relaxed);
+
+        // Wait for the server thread to finish (with a timeout)
+        let timeout = Duration::from_secs(5);
+        let start = Instant::now();
+
+        while start.elapsed() < timeout {
+            if server_thread.is_finished() {
+                server_thread.join().unwrap();
+                println!("UDP server thread finished successfully");
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        panic!("UDP server thread did not finish within the timeout");
     }
 }

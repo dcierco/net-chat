@@ -1,9 +1,11 @@
-use std::net::TcpStream;
-use std::io::{self, BufReader, BufWriter, Write};
-use log::{info, error};
+use crate::common::{receive_message, send_command, send_file, Command, ServerResponse};
+use log::{error, info};
 use std::fs::File;
+use std::io::{self, BufReader, BufWriter, Write};
+use std::net::TcpStream;
 use std::path::Path;
-use crate::common::{Command, send_command, receive_message, send_file, ServerResponse};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 pub fn start_client(address: &str) -> std::io::Result<()> {
     info!("Connecting to server at {}", address);
@@ -19,28 +21,49 @@ pub fn start_client(address: &str) -> std::io::Result<()> {
 
     send_command(&mut writer, &Command::Register(name.clone()))?;
 
+    let running = Arc::new(AtomicBool::new(true));
+    let running_clone = Arc::clone(&running);
+
     // Start a thread to handle incoming messages
     let reader_clone = reader.get_ref().try_clone()?;
     std::thread::spawn(move || {
         let mut reader = BufReader::new(reader_clone);
-        loop {
+        while running_clone.load(Ordering::SeqCst) {
             match receive_message(&mut reader) {
                 Ok(Some(Ok(Command::Scream(msg)))) => println!("\nBroadcast: {}", msg),
-                Ok(Some(Ok(Command::Whisper(from, msg)))) => println!("\nWhisper from {}: {}", from, msg),
-                Ok(Some(Err(ServerResponse::RegistrationSuccessful))) => println!("\nRegistration successful"),
+                Ok(Some(Ok(Command::Whisper(from, msg)))) => {
+                    println!("\nWhisper from {}: {}", from, msg)
+                }
+                Ok(Some(Err(ServerResponse::RegistrationSuccessful))) => {
+                    println!("\nRegistration successful")
+                }
                 Ok(Some(Err(ServerResponse::Message(msg)))) => println!("\nServer: {}", msg),
-                Ok(Some(Ok(Command::SendFile(sender, filename, content)))) => if let Err(e) = handle_received_file(&sender, &filename, &content) { println!("\nFailed to save received file: {}", e);}
-                Ok(Some(Err(ServerResponse::FileTransferStarted(filename)))) => println!("\nReceiving file: {}", filename),
-                Ok(Some(Err(ServerResponse::FileTransferComplete(filename)))) => println!("\nFile received: {}", filename),
-                Ok(Some(Err(ServerResponse::FileTransferFailed(error)))) => println!("\nFile transfer failed: {}", error),
-                Ok(Some(Err(ServerResponse::UserList(users)))) => println!("\nOnline users: {}", users.join(", ")),
+                Ok(Some(Ok(Command::SendFile(sender, filename, content)))) => {
+                    if let Err(e) = handle_received_file(&sender, &filename, &content) {
+                        println!("\nFailed to save received file: {}", e);
+                    }
+                }
+                Ok(Some(Err(ServerResponse::FileTransferStarted(filename)))) => {
+                    println!("\nReceiving file: {}", filename)
+                }
+                Ok(Some(Err(ServerResponse::FileTransferComplete(filename)))) => {
+                    println!("\nFile received: {}", filename)
+                }
+                Ok(Some(Err(ServerResponse::FileTransferFailed(error)))) => {
+                    println!("\nFile transfer failed: {}", error)
+                }
+                Ok(Some(Err(ServerResponse::UserList(users)))) => {
+                    println!("\nOnline users: {}", users.join(", "))
+                }
                 Ok(None) => {
                     println!("\nServer disconnected");
+                    running_clone.store(false, Ordering::SeqCst);
                     break;
                 }
                 Ok(_) => {}
                 Err(e) => {
                     error!("Error receiving message: {}", e);
+                    running_clone.store(false, Ordering::SeqCst);
                     break;
                 }
             }
@@ -49,7 +72,7 @@ pub fn start_client(address: &str) -> std::io::Result<()> {
         }
     });
 
-    loop {
+    while running.load(Ordering::SeqCst) {
         print!("Enter command: ");
         io::stdout().flush()?;
         let mut input = String::new();
@@ -69,7 +92,10 @@ pub fn start_client(address: &str) -> std::io::Result<()> {
                 }
                 "Whisper" => {
                     if parts.len() >= 4 {
-                        send_command(&mut writer, &Command::Whisper(parts[2].to_string(), parts[3].to_string()))?;
+                        send_command(
+                            &mut writer,
+                            &Command::Whisper(parts[2].to_string(), parts[3].to_string()),
+                        )?;
                     } else {
                         println!("Invalid Whisper command. Use: /Whisper/recipient/message/");
                     }
@@ -86,7 +112,10 @@ pub fn start_client(address: &str) -> std::io::Result<()> {
                         println!("Invalid SendFile command. Use: /SendFile/recipient/filename");
                     }
                 }
-                _ => println!("Unknown command. Use /Scream/, /Whisper/, /ListUsers/, or /SendFile/"),      }
+                _ => {
+                    println!("Unknown command. Use /Scream/, /Whisper/, /ListUsers/, or /SendFile/")
+                }
+            }
         } else {
             println!("Invalid command format. Use: `/Command/Message/`, `/Whisper/<recipient>/Message/`, `/ListUsers/` or `/SendFile/<recipient>/<filename>/`");
         }
@@ -123,12 +152,12 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use std::net::TcpListener;
-    use std::path::PathBuf;
-    use std::{fs, thread};
-    use std::time::Duration;
     use crate::common::receive_command;
     use crate::initialize;
+    use std::net::TcpListener;
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use std::{fs, thread};
 
     #[test]
     fn test_client_registration_and_messaging() {
@@ -149,12 +178,26 @@ mod tests {
                 assert!(matches!(command, Command::Scream(msg) if msg == "Hello, Server!"));
             }
 
-            send_command(&mut writer, &Command::Scream("Message received".to_string())).unwrap();
+            send_command(
+                &mut writer,
+                &Command::Scream("Message received".to_string()),
+            )
+            .unwrap();
+
+            // Wait for client to disconnect
+            assert!(matches!(
+                receive_command(&mut reader),
+                Ok(Some(Command::Disconnect))
+            ));
         });
 
         let stream = TcpStream::connect(addr).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut writer = BufWriter::new(stream);
 
@@ -166,6 +209,9 @@ mod tests {
         } else {
             panic!("Did not receive expected message");
         }
+
+        // Disconnect
+        send_command(&mut writer, &Command::Disconnect).unwrap();
 
         // Close connection
         drop(writer);

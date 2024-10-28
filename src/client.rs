@@ -1,11 +1,12 @@
 use crate::common::{receive_message, send_command, send_file, Command, ServerResponse};
 use log::{error, info};
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 pub fn start_client(address: &str, use_udp: bool) -> std::io::Result<()> {
     if use_udp {
@@ -19,9 +20,167 @@ fn start_udp_client(address: &str) -> std::io::Result<()> {
     let socket = UdpSocket::bind("0.0.0.0:0")?;
     socket.connect(address)?;
 
-    // Implement UDP client logic similar to TCP, but using socket.send() and socket.recv_from()
-    // ...
-    println!("UDP client connected to {}", address);
+    print!("Enter your name: ");
+    io::stdout().flush()?;
+    let mut name = String::new();
+    io::stdin().read_line(&mut name)?;
+    let name = name.trim().to_string();
+
+    // Send registration command
+    let register_command = Command::Register(name.clone());
+    let serialized = serde_json::to_string(&register_command)?;
+    socket.send(serialized.as_bytes())?;
+
+    // Start a thread to handle incoming messages
+    let socket_clone = socket.try_clone()?;
+    let running = Arc::new(AtomicBool::new(true));
+    let running_clone = Arc::clone(&running);
+
+    std::thread::spawn(move || {
+        let mut buf = [0; 65507];
+        while running_clone.load(Ordering::SeqCst) {
+            match socket_clone.recv(&mut buf) {
+                Ok(size) => {
+                    if let Ok(message) = String::from_utf8(buf[..size].to_vec()) {
+                        match serde_json::from_str(&message) {
+                            Ok(Command::Scream(msg)) => println!("\nBroadcast: {}", msg),
+                            Ok(Command::Whisper(from, msg)) => {
+                                println!("\nWhisper from {}: {}", from, msg)
+                            }
+                            Ok(Command::SendFile(sender, filename, content)) => {
+                                if let Err(e) = handle_received_file(&sender, &filename, &content) {
+                                    println!("\nFailed to save received file: {}", e);
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(_) => {
+                                // Try parsing as ServerResponse
+                                match serde_json::from_str(&message) {
+                                    Ok(ServerResponse::RegistrationSuccessful) => {
+                                        println!("\nRegistration successful")
+                                    }
+                                    Ok(ServerResponse::Message(msg)) => {
+                                        println!("\nServer: {}", msg)
+                                    }
+                                    Ok(ServerResponse::UserList(users)) => {
+                                        println!("\nOnline users: {}", users.join(", "))
+                                    }
+                                    Ok(ServerResponse::FileTransferStarted(filename)) => {
+                                        println!("\nReceiving file: {}", filename)
+                                    }
+                                    Ok(ServerResponse::FileTransferComplete(filename)) => {
+                                        println!("\nFile received: {}", filename)
+                                    }
+                                    Ok(ServerResponse::FileTransferFailed(error)) => {
+                                        println!("\nFile transfer failed: {}", error)
+                                    }
+                                    Err(e) => error!("Failed to parse server response: {}", e),
+                                }
+                            }
+                        }
+                        print!("Enter command: ");
+                        io::stdout().flush().unwrap();
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => {
+                    error!("UDP receive error: {}", e);
+                    running_clone.store(false, Ordering::SeqCst);
+                    break;
+                }
+            }
+        }
+    });
+
+    // Main input loop
+    while running.load(Ordering::SeqCst) {
+        print!("Enter command: ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let input = input.trim();
+
+        if input.eq_ignore_ascii_case("quit") {
+            let disconnect_command = Command::Disconnect;
+            let serialized = serde_json::to_string(&disconnect_command)?;
+            socket.send(serialized.as_bytes())?;
+            break;
+        }
+
+        let parts: Vec<&str> = input.split('/').collect();
+        if parts.len() >= 2 {
+            let command = match parts[1] {
+                "Scream" => {
+                    if parts.len() >= 3 {
+                        Some(Command::Scream(parts[2].to_string()))
+                    } else {
+                        println!("Invalid Scream command. Use: /Scream/message/");
+                        None
+                    }
+                }
+                "Whisper" => {
+                    if parts.len() >= 4 {
+                        Some(Command::Whisper(parts[2].to_string(), parts[3].to_string()))
+                    } else {
+                        println!("Invalid Whisper command. Use: /Whisper/recipient/message/");
+                        None
+                    }
+                }
+                "ListUsers" => Some(Command::ListUsers),
+                "SendFile" => {
+                    if parts.len() >= 4 {
+                        let recipient = parts[2];
+                        let filename = parts[3];
+                        match send_file_command_udp(&socket, recipient, filename) {
+                            Ok(_) => None, // Command already sent in send_file_command_udp
+                            Err(e) => {
+                                println!("Failed to send file: {}", e);
+                                None
+                            }
+                        }
+                    } else {
+                        println!("Invalid SendFile command. Use: /SendFile/recipient/filename");
+                        None
+                    }
+                }
+                _ => {
+                    println!(
+                        "Unknown command. Use /Scream/, /Whisper/, /ListUsers/, or /SendFile/"
+                    );
+                    None
+                }
+            };
+
+            if let Some(cmd) = command {
+                let serialized = serde_json::to_string(&cmd)?;
+                socket.send(serialized.as_bytes())?;
+            }
+        } else {
+            println!("Invalid command format. Use: `/Command/Message/`, `/Whisper/<recipient>/Message/`, `/ListUsers/` or `/SendFile/<recipient>/<filename>/`");
+        }
+    }
+
+    info!("Disconnecting from server");
+    Ok(())
+}
+
+fn send_file_command_udp(socket: &UdpSocket, recipient: &str, filename: &str) -> io::Result<()> {
+    let path = Path::new(filename);
+    if !path.exists() {
+        println!("File not found: {}", filename);
+        return Ok(());
+    }
+
+    let mut file = File::open(path)?;
+    let mut content = Vec::new();
+    file.read_to_end(&mut content)?;
+
+    let command = Command::SendFile(recipient.to_string(), filename.to_string(), content);
+    let serialized = serde_json::to_string(&command)?;
+    socket.send(serialized.as_bytes())?;
+    println!("File sent: {}", filename);
     Ok(())
 }
 
